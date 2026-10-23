@@ -1,0 +1,93 @@
+version: '3.8'
+
+services:
+  # =========================================================================
+  # 1. POSTGRESQL 16 (WITH NATIVE ROW-LEVEL SECURITY INITIALIZATION)
+  # =========================================================================
+  db:
+    image: postgres:16-alpine
+    container_name: aicte_postgres_rls
+    restart: always
+    environment:
+      POSTGRES_DB: aicte_workflow_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_master_password_2026
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/app/schema_rls_postgres.sql:/docker-entrypoint-initdb.d/01_init_rls.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d aicte_workflow_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # =========================================================================
+  # 2. FASTAPI BACKEND (RULES ENGINE, ISOLATED AI LAYER & AUDIT TRAIL)
+  # =========================================================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aicte_fastapi_backend
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      ENV: production
+      DATABASE_URL: postgresql://aicte_app_user:secure_aicte_app_pass_2026@db:5432/aicte_workflow_db
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: aicte_sih26262_super_secure_key_2026_jwt_token_sign
+    ports:
+      - "8000:8000"
+
+  # =========================================================================
+  # 3. NEXT.JS FRONTEND (CHERRY BLOSSOM SURFACES + INK WASH TYPOGRAPHY)
+  # =========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: aicte_nextjs_frontend
+    restart: always
+    depends_on:
+      - backend
+    environment:
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+
+  # =========================================================================
+  # 4. REDIS (TASK QUEUE & SCHEDULER BROKER)
+  # =========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: aicte_redis
+    restart: always
+    ports:
+      - "6379:6379"
+
+  # =========================================================================
+  # 5. MINIO (S3-COMPATIBLE REGULATORY DOCUMENT STORAGE)
+  # =========================================================================
+  minio:
+    image: minio/minio:RELEASE.2024-01-18T22-51-28Z
+    container_name: aicte_minio_s3
+    restart: always
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: aicte_minio_admin
+      MINIO_ROOT_PASSWORD: aicte_minio_secure_pass_2026
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+
+volumes:
+  pgdata:
+  miniodata:

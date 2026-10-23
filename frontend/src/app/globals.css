@@ -1,0 +1,188 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Surface Colours (Cherry Blossom) */
+  --blossom-100: #F2C7C7;
+  --blossom-300: #FFB7C5;
+  --mint-100: #D5F3D8;
+  --white: #FFFFFF;
+  --ivory: #FFFFE3;
+
+  /* Text and Neutrals (Ink Wash) */
+  --text: #4A4A4A;
+  --text-strong: #2E2E2E;
+  --text-muted: #55687C;
+  --slate: #6D8196;
+  --line: #CBCBCB;
+
+  /* Derived Action & Status Tokens */
+  --blossom-600: #C2456B;
+  --blossom-700: #9E3256;
+  --mint-700: #26693D;
+  --amber-100: #FFF1D6;
+  --amber-700: #8A5A00;
+  --rose-100: #FFE0E3;
+  --rose-700: #A3213A;
+}
+
+@layer base {
+  body {
+    background-color: #FAFAFA;
+    color: var(--text);
+    font-family: 'Plus Jakarta Sans', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    color: var(--text-strong);
+    font-weight: 700;
+  }
+
+  /* Accessible focus ring */
+  *:focus-visible {
+    outline: 2px solid var(--blossom-600);
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  /* Surface rules */
+  .surface-blossom-subtle {
+    background-color: var(--blossom-100);
+    color: var(--text);
+  }
+
+  .surface-mint-subtle {
+    background-color: var(--mint-100);
+    color: var(--text);
+  }
+
+  .surface-white {
+    background-color: var(--white);
+    color: var(--text);
+  }
+
+  /* Dark elements: background --text, foreground --ivory */
+  .dark-element {
+    background-color: var(--text);
+    color: var(--ivory);
+  }
+
+  /* AI Draft Card Rule: White card with blossom-300 left border */
+  .ai-draft-card {
+    background-color: var(--white);
+    border-left: 4px solid var(--blossom-300);
+    border-top: 1px solid var(--line);
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    border-radius: 12px;
+  }
+
+  /* Status Chips (Colour + Icon + Label) */
+  .status-chip-ontrack {
+    background-color: var(--mint-100);
+    color: var(--mint-700);
+    border: 1px solid rgba(38, 105, 61, 0.2);
+    font-weight: 600;
+    font-size: 0.8125rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.25rem 0.625rem;
+    border-radius: 9999px;
+  }
+
+  .status-chip-approaching {
+    background-color: var(--amber-100);
+    color: var(--amber-700);
+    border: 1px solid rgba(138, 90, 0, 0.2);
+    font-weight: 600;
+    font-size: 0.8125rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.25rem 0.625rem;
+    border-radius: 9999px;
+  }
+
+  .status-chip-overdue {
+    background-color: var(--rose-100);
+    color: var(--rose-700);
+    border: 1px solid rgba(163, 33, 58, 0.2);
+    font-weight: 600;
+    font-size: 0.8125rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.25rem 0.625rem;
+    border-radius: 9999px;
+  }
+
+  .status-chip-neutral {
+    background-color: var(--blossom-100);
+    color: var(--text);
+    border: 1px solid rgba(74, 74, 74, 0.15);
+    font-weight: 600;
+    font-size: 0.8125rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.25rem 0.625rem;
+    border-radius: 9999px;
+  }
+
+  /* Primary Button (White on Blossom-600 passes AA) */
+  .btn-primary {
+    background-color: var(--blossom-600);
+    color: #FFFFFF;
+    font-weight: 600;
+    padding: 0.5rem 1rem;
+    border-radius: 0.5rem;
+    transition: background-color 150ms ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    border: 1px solid transparent;
+  }
+  .btn-primary:hover:not(:disabled) {
+    background-color: var(--blossom-700);
+  }
+  .btn-primary:disabled {
+    border-color: var(--line);
+    background-color: #F5F5F5;
+    color: var(--text-muted);
+    cursor: not-allowed;
+  }
+
+  /* Secondary Button */
+  .btn-secondary {
+    background-color: var(--white);
+    color: var(--text);
+    border: 1px solid var(--line);
+    font-weight: 600;
+    padding: 0.5rem 1rem;
+    border-radius: 0.5rem;
+    transition: all 150ms ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .btn-secondary:hover:not(:disabled) {
+    background-color: #FAFAFA;
+    border-color: var(--slate);
+  }
+
+  /* Sample Value Badge (as mandated by user) */
+  .badge-sample-value {
+    background-color: #FFF3CD;
+    color: #856404;
+    border: 1px dashed #FFEEBA;
+    font-size: 0.6875rem;
+    padding: 0.125rem 0.375rem;
+    border-radius: 4px;
+    font-weight: 600;
+    letter-spacing: 0.025em;
+  }
+}
