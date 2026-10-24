@@ -2,13 +2,12 @@
 
 import React, { useState } from 'react';
 import { useApp, DEMO_USERS, UserRole } from '@/lib/app-context';
+import { apiFetch } from '@/lib/api';
 import {
   ShieldCheck,
   Lock,
   Mail,
   KeyRound,
-  ArrowRight,
-  Sparkles,
   Building2,
   CheckCircle2,
   UserCheck,
@@ -20,22 +19,57 @@ import {
   Award,
   RotateCcw,
   Users,
+  UserPlus,
+  HelpCircle,
+  Sparkles,
+  ToggleLeft,
+  ToggleRight,
+  Phone,
 } from 'lucide-react';
 
 export const LoginPage: React.FC = () => {
-  const { loginAsPersona, loginWithToken, restartBootSequence } = useApp();
+  const { loginAsPersona, loginWithToken, restartBootSequence, isDemoMode, evaluatorMode, toggleEvaluatorMode } = useApp();
+  const isEvalActive = evaluatorMode || isDemoMode;
 
-  const [activeTab, setActiveTab] = useState<'credentials' | 'personas'>('credentials');
+  const [activeTab, setActiveTab] = useState<'credentials' | 'signup' | 'verify' | 'forgot' | 'personas'>('credentials');
+  
+  // Login form state
   const [email, setEmail] = useState('ro.swro@aicte-india.org');
   const [password, setPassword] = useState('DemoPassword@123');
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
+  const [successMessage, setSuccessMessage] = useState('');
 
   // MFA State
   const [mfaStep, setMfaStep] = useState(false);
   const [mfaCode, setMfaCode] = useState('');
   const [mfaUserData, setMfaUserData] = useState<any | null>(null);
+
+  // Institution Sign-up State
+  const [signupForm, setSignupForm] = useState({
+    email: '',
+    password: '',
+    fullName: '',
+    institutionName: '',
+    category: 'Engineering & Tech',
+    regionCode: 'SWRO',
+    address: 'Plot 10, Knowledge Park',
+    state: 'Karnataka',
+    whatsappPhone: '',
+    optInWhatsapp: false,
+    preferredLanguage: 'en',
+  });
+  const [signupIssuedToken, setSignupIssuedToken] = useState('');
+
+  // Email Verification State
+  const [verifyToken, setVerifyToken] = useState('');
+
+  // Forgot Password State
+  const [forgotEmail, setForgotEmail] = useState('');
+  const [resetToken, setResetToken] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [forgotStep, setForgotStep] = useState<1 | 2>(1);
 
   const personas = [
     {
@@ -50,37 +84,81 @@ export const LoginPage: React.FC = () => {
       accent: 'border-blossom-300 bg-blossom-100/30',
     },
     {
-      role: 'INSTITUTION_USER' as UserRole,
-      title: 'Institution Principal (Applicant)',
-      name: 'Dr. Ramesh Kumar (Principal)',
-      email: 'principal@rvce.edu.in',
-      region: 'R.V. College of Engg (PID: 1-109283741)',
-      scope: 'Application Intake & Compliance',
-      icon: Building2,
-      badge: 'Technical Institution',
-      accent: 'border-mint-700/30 bg-mint-100/30',
+      role: 'REGIONAL_DIRECTOR' as UserRole,
+      title: 'Regional Director (Assumed Escalation)',
+      name: 'Dr. K. S. Sitaram',
+      email: 'rd.swro@aicte-india.org',
+      region: 'South-Western Region (Bengaluru)',
+      scope: 'Level 2 SLA Escalations • Corridor Lead',
+      icon: Award,
+      badge: 'Regional Director (Assumed)',
+      accent: 'border-blossom-500/40 bg-blossom-100/40',
     },
     {
-      role: 'BUREAU_OFFICER' as UserRole,
-      title: 'Bureau Officer (HQ Approval Bureau)',
-      name: 'Shri Anand Sharma',
-      email: 'approval.bureau@aicte-india.org',
-      region: 'AICTE Headquarters (New Delhi)',
-      scope: 'Pan-India Bureau & Escalation L3',
-      icon: Award,
-      badge: 'Central Bureau',
-      accent: 'border-amberState-700/30 bg-amberState-100/30',
+      role: 'SCRUTINY_MEMBER' as UserRole,
+      title: 'Scrutiny Committee Member',
+      name: 'Prof. N. Meenakshi',
+      email: 'scrutiny.member@aicte-india.org',
+      region: 'SWRO Scrutiny Panels',
+      scope: 'Table 2.3 Norms • Deficiency Memos',
+      icon: UserCheck,
+      badge: 'Scrutiny Member',
+      accent: 'border-mint-700/30 bg-mint-100/30',
     },
     {
       role: 'COMMITTEE_MEMBER' as UserRole,
       title: 'EVC Committee Expert Inspector',
       name: 'Prof. Meenakshi Sundaram',
-      email: 'expert.visit@aicte-india.org',
+      email: 'expert.swro@aicte-india.org',
       region: 'SWRO Inspection Panels',
-      scope: 'On-Site / Virtual Report Verification',
+      scope: '30-min Geotagged Video Verification',
       icon: UserCheck,
       badge: 'Empanelled Expert',
       accent: 'border-slate-300 bg-slate-50',
+    },
+    {
+      role: 'SAC_SHC_MEMBER' as UserRole,
+      title: 'SAC/SHC Appellate Member',
+      name: 'Justice (Retd.) K. V. Narayanan',
+      email: 'sac.appellate@aicte-india.org',
+      region: 'Pan-India Standing Appellate',
+      scope: 'Clause 1.11(a) 7-Day Appeals',
+      icon: Scale,
+      badge: 'Appellate Member',
+      accent: 'border-purple-300 bg-purple-50',
+    },
+    {
+      role: 'BUREAU_OFFICER' as UserRole,
+      title: 'Bureau Officer (HQ Approval Bureau)',
+      name: 'Shri Anand K. Sharma',
+      email: 'approval.bureau@aicte-india.org',
+      region: 'AICTE Headquarters (New Delhi)',
+      scope: 'Pan-India Bureau & Docket Management',
+      icon: Award,
+      badge: 'Central Bureau',
+      accent: 'border-amberState-700/30 bg-amberState-100/30',
+    },
+    {
+      role: 'BUREAU_HEAD' as UserRole,
+      title: 'Bureau Head (Assumed Escalation)',
+      name: 'Dr. M. S. Jayaprakash',
+      email: 'bureau.head@aicte-india.org',
+      region: 'AICTE Headquarters (New Delhi)',
+      scope: 'Level 3 SLA Escalations • Policy Oversight',
+      icon: ShieldCheck,
+      badge: 'Bureau Head (Assumed)',
+      accent: 'border-amberState-700/50 bg-amberState-100/50',
+    },
+    {
+      role: 'INSTITUTION_USER' as UserRole,
+      title: 'Institution Principal (Applicant)',
+      name: 'Dr. Principal (Apex Institute)',
+      email: 'principal.110000001@fictional-aicte.edu.in',
+      region: 'Apex Institute of Technology (PID: 1-10000001)',
+      scope: 'Application Intake & Compliance',
+      icon: Building2,
+      badge: 'Technical Institution',
+      accent: 'border-mint-700/30 bg-mint-100/30',
     },
     {
       role: 'AUDITOR' as UserRole,
@@ -95,11 +173,11 @@ export const LoginPage: React.FC = () => {
     },
     {
       role: 'SUPER_ADMIN' as UserRole,
-      title: 'Member Secretary / Approving Authority',
-      name: 'Prof. Rajive Kumar',
+      title: 'Member Secretary / Council Administration',
+      name: 'Dr. Arvind Ramanathan (Member Secretary)',
       email: 'member.secretary@aicte-india.org',
       region: 'AICTE Council (HQ)',
-      scope: 'Final Council Approvals & Level 4',
+      scope: 'Council Administration & Level 4 (EC decides, Council ratifies)',
       icon: ShieldCheck,
       badge: 'Council Authority',
       accent: 'border-blossom-600/40 bg-blossom-100/50',
@@ -113,28 +191,34 @@ export const LoginPage: React.FC = () => {
   const handleCredentialsSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage('');
+    setSuccessMessage('');
     setLoading(true);
 
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/v1/auth/login', {
+      const data = await apiFetch<any>('/api/v1/auth/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        skipAuth: true,
         body: JSON.stringify({ email, password }),
       });
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.detail || 'Authentication failed');
-      }
 
       if (data.mfa_required) {
         setMfaUserData(data);
         setMfaStep(true);
       } else {
-        // Direct Login
         const role = (data.role || 'REGIONAL_OFFICER') as UserRole;
-        loginAsPersona(role);
+        if (data.access_token) {
+          const matchedUser = DEMO_USERS[role] || {
+            id: data.user_id || 'usr-login',
+            name: data.full_name || email,
+            email,
+            role,
+            roleLabel: data.role || 'Officer',
+            regionCode: data.region_code || 'SWRO',
+          };
+          loginWithToken(matchedUser, data.access_token);
+        } else {
+          loginAsPersona(role);
+        }
       }
     } catch (err: any) {
       setErrorMessage(err.message || 'Invalid credentials. Please verify your email and password.');
@@ -149,32 +233,169 @@ export const LoginPage: React.FC = () => {
     setLoading(true);
 
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/v1/auth/mfa-verify', {
+      const data = await apiFetch<any>('/api/v1/auth/mfa-verify', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        skipAuth: true,
         body: JSON.stringify({
           email: mfaUserData?.email || email,
-          mfa_code: mfaCode.trim(),
+          mfa_code: mfaCode.replace(/\D/g, '').trim(),
         }),
       });
 
-      const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.detail || 'Invalid MFA code');
-      }
-
       const role = (data.role || mfaUserData?.role || 'REGIONAL_OFFICER') as UserRole;
-      loginAsPersona(role);
+      if (data.access_token) {
+        const matchedUser = DEMO_USERS[role] || {
+          id: data.user_id || mfaUserData?.user_id || 'usr-mfa',
+          name: data.full_name || mfaUserData?.full_name || email,
+          email,
+          role,
+          roleLabel: data.role || 'Officer',
+          regionCode: data.region_code || 'SWRO',
+        };
+        loginWithToken(matchedUser, data.access_token);
+      } else {
+        loginAsPersona(role);
+      }
     } catch (err: any) {
-      setErrorMessage(err.message || 'MFA verification failed. Please try again.');
+      setErrorMessage(err.message || 'Invalid TOTP code. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSignupSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMessage('');
+    setSuccessMessage('');
+    setLoading(true);
+
+    try {
+      const resp = await apiFetch<any>('/api/v1/auth/signup', {
+        method: 'POST',
+        skipAuth: true,
+        body: JSON.stringify({
+          email: signupForm.email,
+          password: signupForm.password,
+          full_name: signupForm.fullName,
+          institution_name: signupForm.institutionName,
+          category: signupForm.category,
+          region_code: signupForm.regionCode,
+          address: signupForm.address,
+          state: signupForm.state,
+          whatsapp_phone: signupForm.whatsappPhone || null,
+          opt_in_whatsapp: signupForm.optInWhatsapp,
+          preferred_language: signupForm.preferredLanguage,
+        }),
+      });
+
+      setSuccessMessage('Registration successful! Verification email has been dispatched.');
+      setSignupIssuedToken(resp.verification_token || '');
+      setVerifyToken(resp.verification_token || '');
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Sign-up failed. Please check inputs.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleVerifySubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMessage('');
+    setSuccessMessage('');
+    setLoading(true);
+
+    try {
+      await apiFetch<any>('/api/v1/auth/verify-email', {
+        method: 'POST',
+        skipAuth: true,
+        body: JSON.stringify({ token: verifyToken.trim() }),
+      });
+      setSuccessMessage('Email verified successfully! You may now log in with your credentials.');
+      setTimeout(() => {
+        setActiveTab('credentials');
+        setSuccessMessage('Account activated. Enter your password to sign in.');
+      }, 1500);
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Invalid or expired verification token.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleForgotPasswordSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMessage('');
+    setSuccessMessage('');
+    setLoading(true);
+
+    try {
+      const resp = await apiFetch<any>('/api/v1/auth/forgot-password', {
+        method: 'POST',
+        skipAuth: true,
+        body: JSON.stringify({ email: forgotEmail.trim() }),
+      });
+      setSuccessMessage(resp.message || 'Password reset instructions dispatched.');
+      if (resp.reset_token) {
+        setResetToken(resp.reset_token);
+      }
+      setForgotStep(2);
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Could not process password reset.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleResetPasswordSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMessage('');
+    setSuccessMessage('');
+    setLoading(true);
+
+    try {
+      await apiFetch<any>('/api/v1/auth/reset-password', {
+        method: 'POST',
+        skipAuth: true,
+        body: JSON.stringify({ token: resetToken.trim(), new_password: newPassword }),
+      });
+      setSuccessMessage('Password reset successfully. Please log in with your new credentials.');
+      setTimeout(() => {
+        setActiveTab('credentials');
+        setPassword(newPassword);
+        setForgotStep(1);
+      }, 1500);
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Password reset failed. Invalid or expired token.');
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="min-h-screen bg-[#FAFAFA] flex flex-col justify-between p-4 sm:p-6 lg:p-8">
+    <div className="min-h-screen bg-slate-50 flex flex-col justify-between p-4 sm:p-6 text-ink">
+      {/* Evaluator Mode Banner (When Active) */}
+      {isEvalActive && (
+        <div
+          id="evaluator-mode-login-banner"
+          className="bg-amber-500 text-slate-950 px-6 py-2 text-xs font-bold flex items-center justify-between tracking-wide shadow-sm border border-amber-600 rounded-xl mb-4 max-w-6xl mx-auto w-full"
+        >
+          <div className="flex items-center gap-2">
+            <span className="px-1.5 py-0.5 bg-black text-amber-300 rounded text-[10px] font-black uppercase tracking-wider">
+              EVALUATOR MODE ACTIVE
+            </span>
+            <span>
+              Evaluation Sandbox Active • 1-Click Personas & Time Travel Enabled • Synthetic Evaluation Data
+            </span>
+          </div>
+          <button
+            onClick={() => toggleEvaluatorMode(false)}
+            className="px-2.5 py-1 bg-black text-amber-300 rounded text-[10px] font-bold hover:bg-slate-900 transition-all"
+          >
+            Disable Evaluator Mode
+          </button>
+        </div>
+      )}
+
       {/* Top Header */}
       <div className="max-w-6xl mx-auto w-full flex items-center justify-between border-b border-ink-line pb-4">
         <div className="flex items-center gap-3">
@@ -194,89 +415,133 @@ export const LoginPage: React.FC = () => {
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3">
+          {/* Admin Evaluator Mode Toggle */}
+          <button
+            onClick={() => toggleEvaluatorMode(!isEvalActive)}
+            className={`text-xs font-bold px-3 py-1.5 rounded-lg border flex items-center gap-1.5 transition-all shadow-xs ${
+              isEvalActive
+                ? 'bg-amber-100 text-amber-900 border-amber-300 hover:bg-amber-200'
+                : 'bg-white text-ink-muted hover:text-ink-strong border-ink-line'
+            }`}
+            title="Toggle Evaluator Mode (Enables 1-Click Personas, Demo Shortcuts & Time-Travel)"
+          >
+            {isEvalActive ? <ToggleRight className="w-4 h-4 text-amber-600" /> : <ToggleLeft className="w-4 h-4 text-slate-400" />}
+            <span>Evaluator Mode: {isEvalActive ? 'ON' : 'OFF'}</span>
+          </button>
+
           <button
             onClick={restartBootSequence}
             className="text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-white hover:bg-blossom-100/50 text-ink-strong border border-ink-line shadow-xs flex items-center gap-1.5 transition-all"
             title="Replay system boot & diagnostic loading sequence"
           >
             <RotateCcw className="w-3.5 h-3.5 text-blossom-600" />
-            <span className="hidden md:inline">Replay Boot Sequence</span>
+            <span className="hidden md:inline">Replay Diagnostics</span>
           </button>
-          <span className="hidden sm:inline-block bg-blossom-100 text-blossom-700 font-mono text-[10px] font-bold px-2.5 py-1 rounded border border-blossom-300">
-            APH 2024–27 Aligned
-          </span>
-          <span className="hidden sm:inline-block bg-mint-100 text-mint-700 text-[10px] font-bold px-2.5 py-1 rounded border border-mint-700/30">
-            Govt Cloud Ready
-          </span>
         </div>
       </div>
 
       {/* Main Authentication Card */}
       <div className="max-w-4xl mx-auto w-full my-6">
         <div className="bg-white rounded-2xl border border-ink-line shadow-card overflow-hidden">
-          {/* Card Top Banner */}
+          {/* Card Top Banner with Dynamic Tabs */}
           <div className="bg-gradient-to-r from-blossom-100/60 via-white to-mint-100/40 p-6 border-b border-ink-line flex flex-wrap items-center justify-between gap-4">
             <div>
               <div className="flex items-center gap-2">
                 <ShieldCheck className="w-5 h-5 text-blossom-600" />
                 <h2 className="text-lg font-bold text-ink-strong">
-                  Authorized Stakeholder Single Sign-On (SSO)
+                  Authorized Regulatory Access Portal
                 </h2>
               </div>
               <p className="text-xs text-ink-muted mt-1">
-                Access is restricted to authorized institutional representatives, regional officers, empanelled experts, and AICTE officials.
+                Role-scoped authentication strictly enforced. Separation of Duties (SoD) guaranteed.
               </p>
             </div>
 
-            {/* Tab Switcher */}
+            {/* Navigation Tabs */}
             <div className="flex p-1 bg-slate-100 rounded-xl border border-ink-line text-xs font-semibold">
               <button
                 type="button"
                 onClick={() => {
                   setActiveTab('credentials');
                   setMfaStep(false);
+                  setErrorMessage('');
+                  setSuccessMessage('');
                 }}
-                className={`px-4 py-1.5 rounded-lg transition-all ${
+                className={`px-3 py-1.5 rounded-lg transition-all ${
                   activeTab === 'credentials'
                     ? 'bg-white text-ink-strong shadow-xs font-bold'
                     : 'text-ink-muted hover:text-ink'
                 }`}
               >
-                Standard Credentials
+                Sign In
               </button>
               <button
                 type="button"
                 onClick={() => {
-                  setActiveTab('personas');
-                  setMfaStep(false);
+                  setActiveTab('signup');
+                  setErrorMessage('');
+                  setSuccessMessage('');
                 }}
-                className={`px-4 py-1.5 rounded-lg transition-all ${
-                  activeTab === 'personas'
+                className={`px-3 py-1.5 rounded-lg transition-all ${
+                  activeTab === 'signup'
                     ? 'bg-white text-ink-strong shadow-xs font-bold'
                     : 'text-ink-muted hover:text-ink'
                 }`}
               >
-                1-Click Demo Personas
+                New Institution
               </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveTab('verify');
+                  setErrorMessage('');
+                  setSuccessMessage('');
+                }}
+                className={`px-3 py-1.5 rounded-lg transition-all ${
+                  activeTab === 'verify'
+                    ? 'bg-white text-ink-strong shadow-xs font-bold'
+                    : 'text-ink-muted hover:text-ink'
+                }`}
+              >
+                Verify Email
+              </button>
+              {isEvalActive && (
+                <button
+                  type="button"
+                  data-testid="tab-personas"
+                  onClick={() => {
+                    setActiveTab('personas');
+                    setMfaStep(false);
+                    setErrorMessage('');
+                    setSuccessMessage('');
+                  }}
+                  className={`px-3 py-1.5 rounded-lg transition-all ${
+                    activeTab === 'personas'
+                      ? 'bg-white text-ink-strong shadow-xs font-bold'
+                      : 'text-ink-muted hover:text-ink'
+                  }`}
+                >
+                  ⚡ 1-Click Personas
+                </button>
+              )}
             </div>
           </div>
 
-          {/* TAB 1: CREDENTIALS & TOTP MFA */}
+          {/* TAB 1: SIGN IN (CREDENTIALS & TOTP MFA) */}
           {activeTab === 'credentials' && (
             <div className="p-6 sm:p-8 max-w-md mx-auto">
               {!mfaStep ? (
-                /* Step 1: Username & Password */
                 <form onSubmit={handleCredentialsSubmit} className="space-y-4">
                   <div className="text-center space-y-1 pb-2">
                     <div className="w-10 h-10 rounded-full bg-blossom-100 text-blossom-600 flex items-center justify-center mx-auto mb-2">
                       <KeyRound className="w-5 h-5" />
                     </div>
                     <h3 className="text-sm font-bold text-ink-strong">
-                      AICTE Official Login Portal
+                      Stakeholder Sign In
                     </h3>
                     <p className="text-xs text-ink-muted">
-                      Enter your registered government email address and password.
+                      Enter your verified email address and statutory password.
                     </p>
                   </div>
 
@@ -284,6 +549,13 @@ export const LoginPage: React.FC = () => {
                     <div className="p-3 bg-roseState-100 border border-roseState-700/30 rounded-xl text-xs text-roseState-700 flex items-start gap-2">
                       <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
                       <span>{errorMessage}</span>
+                    </div>
+                  )}
+
+                  {successMessage && (
+                    <div className="p-3 bg-mint-100 border border-mint-700/30 rounded-xl text-xs text-mint-800 flex items-start gap-2">
+                      <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5 text-mint-700" />
+                      <span>{successMessage}</span>
                     </div>
                   )}
 
@@ -305,7 +577,18 @@ export const LoginPage: React.FC = () => {
                   <div className="space-y-1.5">
                     <div className="flex items-center justify-between">
                       <label className="text-xs font-semibold text-ink-strong">Password</label>
-                      <span className="text-[10px] text-ink-muted">Demo: DemoPassword@123</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveTab('forgot');
+                          setForgotEmail(email);
+                          setErrorMessage('');
+                          setSuccessMessage('');
+                        }}
+                        className="text-[11px] text-blossom-600 hover:underline font-semibold"
+                      >
+                        Forgot Password?
+                      </button>
                     </div>
                     <div className="relative">
                       <Lock className="w-4 h-4 text-ink-muted absolute left-3 top-1/2 -translate-y-1/2" />
@@ -327,42 +610,44 @@ export const LoginPage: React.FC = () => {
                     </div>
                   </div>
 
-                  {/* Pre-fill Quick Buttons */}
-                  <div className="pt-1">
-                    <span className="text-[10px] font-semibold text-ink-muted">Quick fill credentials:</span>
-                    <div className="flex flex-wrap gap-1.5 mt-1">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setEmail('ro.swro@aicte-india.org');
-                          setPassword('DemoPassword@123');
-                        }}
-                        className="text-[10px] bg-slate-100 hover:bg-slate-200 text-ink px-2 py-0.5 rounded border border-ink-line"
-                      >
-                        SWRO Officer
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setEmail('principal.110000001@fictional-aicte.edu.in');
-                          setPassword('DemoPassword@123');
-                        }}
-                        className="text-[10px] bg-slate-100 hover:bg-slate-200 text-ink px-2 py-0.5 rounded border border-ink-line"
-                      >
-                        Institution
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setEmail('member.secretary@aicte-india.org');
-                          setPassword('DemoPassword@123');
-                        }}
-                        className="text-[10px] bg-slate-100 hover:bg-slate-200 text-ink px-2 py-0.5 rounded border border-ink-line"
-                      >
-                        Member Secretary
-                      </button>
+                  {/* Pre-fill Quick Buttons (Only in Evaluator Mode) */}
+                  {isEvalActive && (
+                    <div className="pt-1">
+                      <span className="text-[10px] font-semibold text-ink-muted">Quick fill credentials (Evaluator Mode):</span>
+                      <div className="flex flex-wrap gap-1.5 mt-1">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEmail('ro.swro@aicte-india.org');
+                            setPassword('DemoPassword@123');
+                          }}
+                          className="text-[10px] bg-slate-100 hover:bg-slate-200 text-ink px-2 py-0.5 rounded border border-ink-line"
+                        >
+                          Regional Officer
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEmail('principal.110000001@fictional-aicte.edu.in');
+                            setPassword('DemoPassword@123');
+                          }}
+                          className="text-[10px] bg-slate-100 hover:bg-slate-200 text-ink px-2 py-0.5 rounded border border-ink-line"
+                        >
+                          Institution
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEmail('member.secretary@aicte-india.org');
+                            setPassword('DemoPassword@123');
+                          }}
+                          className="text-[10px] bg-slate-100 hover:bg-slate-200 text-ink px-2 py-0.5 rounded border border-ink-line"
+                        >
+                          Member Secretary
+                        </button>
+                      </div>
                     </div>
-                  </div>
+                  )}
 
                   <button
                     type="submit"
@@ -371,20 +656,6 @@ export const LoginPage: React.FC = () => {
                   >
                     {loading ? 'Verifying Credentials...' : 'Sign In with Password →'}
                   </button>
-
-                  <div className="pt-3 border-t border-ink-line text-center">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setActiveTab('personas');
-                        setMfaStep(false);
-                      }}
-                      className="text-xs text-blossom-700 hover:text-blossom-800 font-semibold inline-flex items-center gap-1.5 transition-colors"
-                    >
-                      <Users className="w-3.5 h-3.5" />
-                      <span>Or evaluate with 1-Click Demo Personas →</span>
-                    </button>
-                  </div>
                 </form>
               ) : (
                 /* Step 2: Interactive TOTP MFA Verification */
@@ -397,14 +668,33 @@ export const LoginPage: React.FC = () => {
                       Two-Factor Authentication (TOTP MFA)
                     </h3>
                     <p className="text-xs text-ink-muted">
-                      A 6-digit authentication code has been generated for{' '}
-                      <strong className="text-ink">{email}</strong>.
+                      Enter the 6-digit TOTP code for <strong className="text-ink">{email}</strong>.
                     </p>
                   </div>
 
-                  <div className="bg-amberState-100/60 p-3 rounded-xl border border-amberState-700/20 text-xs text-amberState-700 text-center">
-                    <strong>Demo Evaluation Notice:</strong> Enter test code <code className="font-mono font-bold bg-white px-1.5 py-0.5 rounded border border-amberState-700/30">123456</code> to proceed.
-                  </div>
+                  {!isEvalActive ? (
+                    <div className="bg-amberState-100 border border-amberState-700/30 p-3 rounded-xl text-xs text-amberState-700 flex flex-col items-center gap-1.5 text-center">
+                      <div className="flex items-center gap-1.5 font-bold">
+                        <AlertCircle className="w-4 h-4 text-amberState-700" />
+                        <span>Evaluator Mode is currently OFF</span>
+                      </div>
+                      <p className="text-[11px] leading-relaxed">
+                        To use sandbox demo PIN <code className="font-mono font-bold bg-white px-1.5 py-0.5 rounded border border-amberState-700/30">123456</code>, please activate Evaluator Mode.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => toggleEvaluatorMode(true)}
+                        className="mt-1 px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-bold transition-all shadow-xs"
+                      >
+                        ⚡ Turn Evaluator Mode ON
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="bg-mint-100/70 p-3 rounded-xl border border-mint-700/30 text-xs text-mint-800 text-center flex items-center justify-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-mint-700 shrink-0" />
+                      <span><strong>(Evaluator Sandbox Active):</strong> Enter test PIN <code className="font-mono font-bold bg-white px-1.5 py-0.5 rounded border border-mint-700/40">123456</code>.</span>
+                    </div>
+                  )}
 
                   {errorMessage && (
                     <div className="p-3 bg-roseState-100 border border-roseState-700/30 rounded-xl text-xs text-roseState-700 flex items-start gap-2">
@@ -415,13 +705,13 @@ export const LoginPage: React.FC = () => {
 
                   <div className="space-y-1.5">
                     <label className="text-xs font-semibold text-ink-strong text-center block">
-                      Enter 6-Digit TOTP Code
+                      6-Digit Security PIN
                     </label>
                     <input
                       type="text"
                       maxLength={6}
                       value={mfaCode}
-                      onChange={(e) => setMfaCode(e.target.value)}
+                      onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
                       required
                       autoFocus
                       placeholder="123456"
@@ -431,7 +721,7 @@ export const LoginPage: React.FC = () => {
 
                   <button
                     type="submit"
-                    disabled={loading || mfaCode.length < 6}
+                    disabled={loading || mfaCode.replace(/\D/g, '').length < 6}
                     className="btn-primary w-full justify-center !py-2.5 shadow-soft"
                   >
                     {loading ? 'Verifying TOTP Code...' : 'Verify MFA & Enter Portal →'}
@@ -441,7 +731,7 @@ export const LoginPage: React.FC = () => {
                     <button
                       type="button"
                       onClick={() => setMfaStep(false)}
-                      className="text-xs text-ink-muted hover:text-ink underline"
+                      className="text-xs text-ink-muted hover:text-ink font-semibold"
                     >
                       ← Back to Password Login
                     </button>
@@ -451,104 +741,378 @@ export const LoginPage: React.FC = () => {
             </div>
           )}
 
-          {/* TAB 2: ONE-CLICK DEMO PERSONAS */}
-          {activeTab === 'personas' && (
-            <div className="p-6 sm:p-8 space-y-5">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h3 className="text-sm font-bold text-ink-strong uppercase tracking-wider">
-                    Select a Stakeholder Persona for Evaluation
-                  </h3>
-                  <p className="text-xs text-ink-muted">
-                    Click any role below to instantly authenticate with strict RBAC and regional row-level security scopes.
-                  </p>
+          {/* TAB 2: INSTITUTION SIGN-UP */}
+          {activeTab === 'signup' && (
+            <div className="p-6 sm:p-8 max-w-lg mx-auto">
+              <div className="text-center space-y-1 pb-4">
+                <div className="w-10 h-10 rounded-full bg-mint-100 text-mint-700 flex items-center justify-center mx-auto mb-2">
+                  <UserPlus className="w-5 h-5" />
                 </div>
-                <span className="text-[10px] font-bold bg-blossom-100 text-blossom-700 px-2 py-0.5 rounded border border-blossom-300">
-                  Statutory Simulation Mode
-                </span>
+                <h3 className="text-sm font-bold text-ink-strong">
+                  Register Technical Institution
+                </h3>
+                <p className="text-xs text-ink-muted">
+                  Create an institutional account for regulatory approvals. Email verification required.
+                </p>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {personas.map((p) => {
-                  const Icon = p.icon;
+              {errorMessage && (
+                <div className="p-3 mb-4 bg-roseState-100 border border-roseState-700/30 rounded-xl text-xs text-roseState-700 flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{errorMessage}</span>
+                </div>
+              )}
+
+              {successMessage && (
+                <div className="p-4 mb-4 bg-mint-100 border border-mint-700/30 rounded-xl text-xs text-mint-800 space-y-2">
+                  <div className="flex items-center gap-2 font-bold text-mint-900">
+                    <CheckCircle2 className="w-4 h-4 text-mint-700" />
+                    <span>{successMessage}</span>
+                  </div>
+                  {signupIssuedToken && (
+                    <div className="bg-white p-2.5 rounded-lg border border-mint-300 font-mono text-[11px] text-ink break-all">
+                      <div className="text-[10px] text-ink-muted uppercase font-sans font-bold">Verification Token:</div>
+                      {signupIssuedToken}
+                    </div>
+                  )}
+                  <button
+                    onClick={() => {
+                      setVerifyToken(signupIssuedToken);
+                      setActiveTab('verify');
+                    }}
+                    className="btn-primary !py-1.5 !px-3 text-xs w-full justify-center"
+                  >
+                    Proceed to Email Verification →
+                  </button>
+                </div>
+              )}
+
+              <form onSubmit={handleSignupSubmit} className="space-y-3">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-ink-strong">Official Email</label>
+                    <input
+                      type="email"
+                      required
+                      value={signupForm.email}
+                      onChange={(e) => setSignupForm({ ...signupForm, email: e.target.value })}
+                      placeholder="principal@institute.edu.in"
+                      className="w-full px-3 py-1.5 text-xs border border-ink-line rounded-lg"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-ink-strong">Password</label>
+                    <input
+                      type="password"
+                      required
+                      value={signupForm.password}
+                      onChange={(e) => setSignupForm({ ...signupForm, password: e.target.value })}
+                      placeholder="••••••••••••"
+                      className="w-full px-3 py-1.5 text-xs border border-ink-line rounded-lg"
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-ink-strong">Authorized Signatory Name</label>
+                  <input
+                    type="text"
+                    required
+                    value={signupForm.fullName}
+                    onChange={(e) => setSignupForm({ ...signupForm, fullName: e.target.value })}
+                    placeholder="e.g. Dr. Rajesh Sharma (Principal)"
+                    className="w-full px-3 py-1.5 text-xs border border-ink-line rounded-lg"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-ink-strong">Institution Name</label>
+                  <input
+                    type="text"
+                    required
+                    value={signupForm.institutionName}
+                    onChange={(e) => setSignupForm({ ...signupForm, institutionName: e.target.value })}
+                    placeholder="e.g. Bharath Institute of Technology"
+                    className="w-full px-3 py-1.5 text-xs border border-ink-line rounded-lg"
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-ink-strong">Regional Office</label>
+                    <select
+                      value={signupForm.regionCode}
+                      onChange={(e) => setSignupForm({ ...signupForm, regionCode: e.target.value })}
+                      className="w-full px-3 py-1.5 text-xs border border-ink-line rounded-lg bg-white"
+                    >
+                      <option value="SWRO">South-Western (SWRO - Bengaluru)</option>
+                      <option value="SRO">Southern (SRO - Chennai)</option>
+                      <option value="WRO">Western (WRO - Mumbai)</option>
+                      <option value="NRO">Northern (NRO - Kanpur)</option>
+                      <option value="ERO">Eastern (ERO - Kolkata)</option>
+                      <option value="CRO">Central (CRO - Bhopal)</option>
+                      <option value="NWRO">North-Western (NWRO - Chandigarh)</option>
+                    </select>
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-ink-strong">Category</label>
+                    <select
+                      value={signupForm.category}
+                      onChange={(e) => setSignupForm({ ...signupForm, category: e.target.value })}
+                      className="w-full px-3 py-1.5 text-xs border border-ink-line rounded-lg bg-white"
+                    >
+                      <option value="Engineering & Tech">Engineering & Technology</option>
+                      <option value="Management">Management</option>
+                      <option value="Pharmacy">Pharmacy</option>
+                      <option value="Applied Engineering">Applied Engineering</option>
+                      <option value="Architecture">Architecture & Planning</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-ink-strong">WhatsApp Notifications (Sandbox / Opt-in)</label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={signupForm.whatsappPhone}
+                      onChange={(e) => setSignupForm({ ...signupForm, whatsappPhone: e.target.value })}
+                      placeholder="+919876543210"
+                      className="flex-1 px-3 py-1.5 text-xs border border-ink-line rounded-lg"
+                    />
+                    <label className="flex items-center gap-1.5 text-[11px] font-medium cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={signupForm.optInWhatsapp}
+                        onChange={(e) => setSignupForm({ ...signupForm, optInWhatsapp: e.target.checked })}
+                        className="rounded text-blossom-600"
+                      />
+                      <span>Opt-in</span>
+                    </label>
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="btn-primary w-full justify-center !py-2.5 mt-3 shadow-soft"
+                >
+                  {loading ? 'Creating Institution Account...' : 'Register & Dispatch Verification Email →'}
+                </button>
+              </form>
+            </div>
+          )}
+
+          {/* TAB 3: VERIFY EMAIL */}
+          {activeTab === 'verify' && (
+            <div className="p-6 sm:p-8 max-w-md mx-auto">
+              <div className="text-center space-y-1 pb-4">
+                <div className="w-10 h-10 rounded-full bg-blossom-100 text-blossom-600 flex items-center justify-center mx-auto mb-2">
+                  <Mail className="w-5 h-5" />
+                </div>
+                <h3 className="text-sm font-bold text-ink-strong">
+                  Verify Email Address
+                </h3>
+                <p className="text-xs text-ink-muted">
+                  Enter the verification token sent to your registered institutional email.
+                </p>
+              </div>
+
+              {errorMessage && (
+                <div className="p-3 mb-4 bg-roseState-100 border border-roseState-700/30 rounded-xl text-xs text-roseState-700 flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{errorMessage}</span>
+                </div>
+              )}
+
+              {successMessage && (
+                <div className="p-3 mb-4 bg-mint-100 border border-mint-700/30 rounded-xl text-xs text-mint-800 flex items-start gap-2">
+                  <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5 text-mint-700" />
+                  <span>{successMessage}</span>
+                </div>
+              )}
+
+              <form onSubmit={handleVerifySubmit} className="space-y-4">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-ink-strong">Cryptographic Verification Token</label>
+                  <input
+                    type="text"
+                    required
+                    value={verifyToken}
+                    onChange={(e) => setVerifyToken(e.target.value)}
+                    placeholder="Enter or paste token..."
+                    className="w-full px-3 py-2 text-xs font-mono border border-ink-line rounded-xl focus:border-blossom-600"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={loading || !verifyToken}
+                  className="btn-primary w-full justify-center !py-2.5 shadow-soft"
+                >
+                  {loading ? 'Verifying Token...' : 'Confirm Email Verification →'}
+                </button>
+              </form>
+            </div>
+          )}
+
+          {/* TAB 4: FORGOT / RESET PASSWORD */}
+          {activeTab === 'forgot' && (
+            <div className="p-6 sm:p-8 max-w-md mx-auto">
+              <div className="text-center space-y-1 pb-4">
+                <div className="w-10 h-10 rounded-full bg-amber-100 text-amber-700 flex items-center justify-center mx-auto mb-2">
+                  <HelpCircle className="w-5 h-5" />
+                </div>
+                <h3 className="text-sm font-bold text-ink-strong">
+                  Password Reset Recovery
+                </h3>
+                <p className="text-xs text-ink-muted">
+                  {forgotStep === 1
+                    ? 'Enter your registered email address to receive reset instructions.'
+                    : 'Enter the reset token received via SMTP and your new password.'}
+                </p>
+              </div>
+
+              {errorMessage && (
+                <div className="p-3 mb-4 bg-roseState-100 border border-roseState-700/30 rounded-xl text-xs text-roseState-700 flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{errorMessage}</span>
+                </div>
+              )}
+
+              {successMessage && (
+                <div className="p-3 mb-4 bg-mint-100 border border-mint-700/30 rounded-xl text-xs text-mint-800 flex items-start gap-2">
+                  <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5 text-mint-700" />
+                  <span>{successMessage}</span>
+                </div>
+              )}
+
+              {forgotStep === 1 ? (
+                <form onSubmit={handleForgotPasswordSubmit} className="space-y-4">
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-semibold text-ink-strong">Registered Email</label>
+                    <input
+                      type="email"
+                      required
+                      value={forgotEmail}
+                      onChange={(e) => setForgotEmail(e.target.value)}
+                      placeholder="e.g. ro.swro@aicte-india.org"
+                      className="w-full px-3 py-2 text-xs border border-ink-line rounded-xl"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={loading}
+                    className="btn-primary w-full justify-center !py-2.5 shadow-soft"
+                  >
+                    {loading ? 'Sending Reset Token...' : 'Dispatch Reset Email →'}
+                  </button>
+                  <div className="text-center">
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('credentials')}
+                      className="text-xs text-ink-muted hover:text-ink font-semibold"
+                    >
+                      ← Back to Login
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <form onSubmit={handleResetPasswordSubmit} className="space-y-3">
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-ink-strong">Password Reset Token</label>
+                    <input
+                      type="text"
+                      required
+                      value={resetToken}
+                      onChange={(e) => setResetToken(e.target.value)}
+                      placeholder="Paste reset token..."
+                      className="w-full px-3 py-1.5 text-xs font-mono border border-ink-line rounded-lg"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-ink-strong">New Password</label>
+                    <input
+                      type="password"
+                      required
+                      value={newPassword}
+                      onChange={(e) => setNewPassword(e.target.value)}
+                      placeholder="••••••••••••"
+                      className="w-full px-3 py-1.5 text-xs border border-ink-line rounded-lg"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={loading}
+                    className="btn-primary w-full justify-center !py-2.5 mt-2 shadow-soft"
+                  >
+                    {loading ? 'Updating Password...' : 'Update Password & Unlock →'}
+                  </button>
+                </form>
+              )}
+            </div>
+          )}
+
+          {/* TAB 5: 1-CLICK PERSONAS (EVALUATOR MODE ONLY) */}
+          {activeTab === 'personas' && isEvalActive && (
+            <div className="p-6 sm:p-8">
+              <div className="mb-6 p-4 rounded-xl bg-amber-50 border border-amber-200 flex items-start gap-3">
+                <Sparkles className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                <div className="text-xs">
+                  <div className="font-bold text-amber-900">
+                    Evaluator Sandbox Active (1-Click Authentication)
+                  </div>
+                  <div className="text-amber-800 mt-0.5">
+                    Click any stakeholder persona below to instantly obtain a cryptographically signed JWT token with that persona&apos;s exact jurisdictional scope and Separation of Duties boundaries.
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                {personas.map((persona) => {
+                  const Icon = persona.icon;
                   return (
                     <button
-                      key={p.role}
+                      key={persona.role}
                       type="button"
-                      onClick={() => handlePersonaClick(p.role)}
-                      className={`text-left p-4 rounded-xl border transition-all hover:scale-[1.02] hover:shadow-soft flex flex-col justify-between ${p.accent}`}
+                      onClick={() => handlePersonaClick(persona.role)}
+                      className={`text-left p-4 rounded-xl border transition-all hover:shadow-card hover:border-blossom-600/50 hover:-translate-y-0.5 flex flex-col justify-between ${persona.accent}`}
                     >
-                      <div className="space-y-2">
-                        <div className="flex items-center justify-between">
-                          <div className="w-8 h-8 rounded-lg bg-white border border-ink-line flex items-center justify-center text-blossom-600 shadow-xs">
-                            <Icon className="w-4 h-4" />
-                          </div>
-                          <span className="text-[9px] font-bold uppercase tracking-wider bg-white/80 px-2 py-0.5 rounded border border-slate-200 text-ink-muted">
-                            {p.badge}
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-white/80 border border-slate-200">
+                            {persona.badge}
                           </span>
+                          <Icon className="w-4 h-4 text-ink-muted" />
                         </div>
-
-                        <div>
-                          <div className="text-xs font-bold text-ink-strong">
-                            {p.title}
-                          </div>
-                          <div className="text-[11px] text-ink font-semibold mt-0.5">
-                            {p.name}
-                          </div>
-                          <div className="text-[10px] text-ink-muted">
-                            {p.region}
-                          </div>
-                        </div>
+                        <div className="text-sm font-bold text-ink-strong">{persona.title}</div>
+                        <div className="text-xs font-semibold text-ink-muted mt-0.5">{persona.name}</div>
+                        <div className="text-[11px] text-ink-muted/80 mt-1">{persona.region}</div>
                       </div>
 
-                      <div className="pt-3 mt-3 border-t border-slate-200/60 flex items-center justify-between text-[11px]">
-                        <span className="text-[10px] text-ink-muted italic truncate max-w-[170px]">
-                          {p.scope}
+                      <div className="mt-3 pt-2 border-t border-slate-200/60 flex items-center justify-between text-[11px]">
+                        <span className="text-ink-muted font-medium">{persona.scope}</span>
+                        <span className="font-bold text-blossom-700 flex items-center gap-1">
+                          Log In →
                         </span>
-                        <div className="flex items-center gap-1 font-bold text-blossom-700 shrink-0">
-                          <span>Enter</span>
-                          <ArrowRight className="w-3.5 h-3.5" />
-                        </div>
                       </div>
                     </button>
                   );
                 })}
               </div>
-
-              <div className="pt-3 border-t border-ink-line flex flex-wrap items-center justify-between gap-2 text-xs text-ink-muted">
-                <span>Prefer official email and password authentication?</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setActiveTab('credentials');
-                    setMfaStep(false);
-                  }}
-                  className="font-semibold text-blossom-700 hover:text-blossom-800 inline-flex items-center gap-1 transition-colors"
-                >
-                  <KeyRound className="w-3.5 h-3.5" />
-                  <span>Switch to Standard Credentials →</span>
-                </button>
-              </div>
             </div>
           )}
-
-          {/* Footer Security Strip */}
-          <div className="bg-[#FAFAFA] p-4 border-t border-ink-line flex flex-wrap items-center justify-between gap-3 text-[11px] text-ink-muted">
-            <div className="flex items-center gap-4">
-              <span>• 256-Bit TLS Encryption</span>
-              <span>• Pairwise SoD Enforced</span>
-              <span>• DPDP Act 2023 Aligned</span>
-            </div>
-            <div className="text-blossom-700 font-semibold">
-              Statutory reserve: Automation supports, authorized humans decide.
-            </div>
-          </div>
         </div>
       </div>
 
       {/* Footer */}
-      <div className="max-w-6xl mx-auto w-full text-center text-xs text-ink-muted pt-2 border-t border-ink-line">
-        © 2026 All India Council for Technical Education (AICTE), Ministry of Education, Government of India.
+      <div className="max-w-6xl mx-auto w-full text-center py-4 border-t border-ink-line text-[11px] text-ink-muted space-y-1">
+        <div>
+          Official AICTE Statutory Portal • Built strictly against AICTE Approval Process Handbook (APH 2024–27)
+        </div>
+        <div>
+          SHA-256 Hash-Chained Audit Ledger Active • DPDP Act 2023 Compliant • Separation of Duties Enforced
+        </div>
       </div>
     </div>
   );

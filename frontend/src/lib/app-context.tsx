@@ -1,12 +1,17 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect } from 'react';
+import { apiFetch, API_BASE } from '@/lib/api';
 
 export type UserRole =
   | 'INSTITUTION_USER'
   | 'REGIONAL_OFFICER'
+  | 'REGIONAL_DIRECTOR'
   | 'BUREAU_OFFICER'
+  | 'BUREAU_HEAD'
+  | 'SCRUTINY_MEMBER'
   | 'COMMITTEE_MEMBER'
+  | 'SAC_SHC_MEMBER'
   | 'SUPER_ADMIN'
   | 'AUDITOR';
 
@@ -19,6 +24,7 @@ export interface UserProfile {
   regionCode: string;
   institutionName?: string;
   institutionId?: string;
+  token?: string;
 }
 
 export interface RegionInfo {
@@ -70,13 +76,37 @@ export const DEMO_USERS: Record<UserRole, UserProfile> = {
     roleLabel: 'Regional Officer (SWRO)',
     regionCode: 'SWRO',
   },
+  REGIONAL_DIRECTOR: {
+    id: 'usr-rd-01',
+    name: 'Dr. K. S. Sitaram',
+    email: 'rd.swro@aicte-india.org',
+    role: 'REGIONAL_DIRECTOR',
+    roleLabel: 'Regional Director (Assumed Escalation)',
+    regionCode: 'SWRO',
+  },
   BUREAU_OFFICER: {
     id: 'usr-bo-01',
-    name: 'Shri Anand Sharma',
+    name: 'Shri Anand K. Sharma',
     email: 'approval.bureau@aicte-india.org',
     role: 'BUREAU_OFFICER',
     roleLabel: 'Bureau Officer (HQ)',
     regionCode: 'HQ',
+  },
+  BUREAU_HEAD: {
+    id: 'usr-bh-01',
+    name: 'Dr. M. S. Jayaprakash',
+    email: 'bureau.head@aicte-india.org',
+    role: 'BUREAU_HEAD',
+    roleLabel: 'Bureau Head (Assumed Escalation)',
+    regionCode: 'HQ',
+  },
+  SCRUTINY_MEMBER: {
+    id: 'usr-sm-01',
+    name: 'Prof. N. Meenakshi',
+    email: 'scrutiny.member@aicte-india.org',
+    role: 'SCRUTINY_MEMBER',
+    roleLabel: 'Scrutiny Committee Member',
+    regionCode: 'SWRO',
   },
   COMMITTEE_MEMBER: {
     id: 'usr-cm-01',
@@ -86,12 +116,20 @@ export const DEMO_USERS: Record<UserRole, UserProfile> = {
     roleLabel: 'EVC Committee Expert',
     regionCode: 'SWRO',
   },
+  SAC_SHC_MEMBER: {
+    id: 'usr-sac-01',
+    name: 'Justice (Retd.) K. V. Narayanan',
+    email: 'sac.appellate@aicte-india.org',
+    role: 'SAC_SHC_MEMBER',
+    roleLabel: 'SAC/SHC Appellate Member',
+    regionCode: 'HQ',
+  },
   SUPER_ADMIN: {
     id: 'usr-sa-01',
-    name: 'Prof. Rajive Kumar (Member Secretary)',
+    name: 'Dr. Arvind Ramanathan (Member Secretary)',
     email: 'member.secretary@aicte-india.org',
     role: 'SUPER_ADMIN',
-    roleLabel: 'Member Secretary / Approving Authority',
+    roleLabel: 'Member Secretary / Council Administration',
     regionCode: 'HQ',
   },
   AUDITOR: {
@@ -128,6 +166,14 @@ interface AppContextType {
   loginAsPersona: (role: UserRole) => void;
   loginWithToken: (user: UserProfile, token: string) => void;
   logout: () => void;
+  isDemoMode: boolean;
+  setIsDemoMode: (val: boolean) => void;
+  evaluatorMode: boolean;
+  setEvaluatorMode: (val: boolean) => void;
+  toggleEvaluatorMode: (enabled: boolean) => Promise<void>;
+  selectedApplicationId: string | null;
+  setSelectedApplicationId: (id: string | null) => void;
+  openCaseDocket: (id: string) => void;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -135,21 +181,80 @@ const AppContext = createContext<AppContextType | undefined>(undefined);
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [isSystemLoading, setIsSystemLoading] = useState<boolean>(true);
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [isDemoMode, setIsDemoMode] = useState<boolean>(false);
+  const [evaluatorMode, setEvaluatorMode] = useState<boolean>(false);
   const [currentUser, setCurrentUser] = useState<UserProfile>(DEMO_USERS.REGIONAL_OFFICER);
   const [currentRegion, setCurrentRegion] = useState<RegionInfo>(SAMPLE_REGIONS[0]); // Default: SWRO Bengaluru
   const [virtualDaysOffset, setVirtualDaysOffset] = useState<number>(0);
   const [baseDate] = useState<Date>(new Date('2026-10-22T09:00:00Z'));
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [activeNavTab, setActiveNavTab] = useState<string>('dashboard');
+  const [selectedApplicationId, setSelectedApplicationId] = useState<string | null>(null);
+
+  const openCaseDocket = (id: string) => {
+    setSelectedApplicationId(id);
+    setActiveNavTab('case');
+  };
+
+  useEffect(() => {
+    apiFetch<any>('/api/v1/system/mode', { skipAuth: true })
+      .then((data) => {
+        if (data) {
+          const mode = Boolean(data.evaluator_mode ?? data.demo_mode ?? false);
+          setIsDemoMode(mode);
+          setEvaluatorMode(mode);
+        }
+      })
+      .catch((err) => {
+        console.warn('Could not fetch system execution mode:', err);
+      });
+  }, []);
+
+  const toggleEvaluatorMode = async (enabled: boolean) => {
+    try {
+      const data = await apiFetch<any>('/api/v1/system/evaluator-mode', {
+        method: 'POST',
+        skipAuth: true,
+        body: JSON.stringify({ enabled }),
+      });
+      const active = Boolean(data.evaluator_mode ?? enabled);
+      setIsDemoMode(active);
+      setEvaluatorMode(active);
+    } catch (err) {
+      console.error('Failed to toggle Evaluator Mode:', err);
+      setIsDemoMode(enabled);
+      setEvaluatorMode(enabled);
+    }
+  };
 
   const restartBootSequence = () => {
     setIsAuthenticated(false);
     setIsSystemLoading(true);
   };
 
-  const loginAsPersona = (role: UserRole) => {
+  const loginAsPersona = async (role: UserRole) => {
     const user = DEMO_USERS[role];
     if (user) {
+      try {
+        const data = await apiFetch<any>(`/api/v1/auth/demo-token/${role}`, {
+          method: 'POST',
+          skipAuth: true,
+        });
+        if (data && data.access_token) {
+          const userWithToken = { ...user, token: data.access_token };
+          setCurrentUser(userWithToken);
+          if (typeof window !== 'undefined') {
+            localStorage.setItem('aicte_auth_token', data.access_token);
+          }
+          const reg = SAMPLE_REGIONS.find((r) => r.code === user.regionCode) || SAMPLE_REGIONS[0];
+          setCurrentRegion(reg);
+          setIsAuthenticated(true);
+          setActiveNavTab('dashboard');
+          return;
+        }
+      } catch (e) {
+        console.warn('Demo token endpoint unreachable, using local demo user', e);
+      }
       setCurrentUser(user);
       const reg = SAMPLE_REGIONS.find((r) => r.code === user.regionCode) || SAMPLE_REGIONS[0];
       setCurrentRegion(reg);
@@ -159,7 +264,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const loginWithToken = (user: UserProfile, token: string) => {
-    setCurrentUser(user);
+    const userWithToken = { ...user, token };
+    setCurrentUser(userWithToken);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('aicte_auth_token', token);
+    }
     const reg = SAMPLE_REGIONS.find((r) => r.code === user.regionCode) || SAMPLE_REGIONS[0];
     setCurrentRegion(reg);
     setIsAuthenticated(true);
@@ -167,6 +276,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const logout = () => {
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('aicte_auth_token');
+    }
     setIsAuthenticated(false);
   };
 
@@ -214,7 +326,30 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const virtualDate = new Date(baseDate.getTime() + virtualDaysOffset * 24 * 60 * 60 * 1000);
 
-  const switchRole = (role: UserRole) => {
+  const switchRole = async (role: UserRole) => {
+    try {
+      const data = await apiFetch<any>(`/api/v1/auth/demo-token/${role}`, {
+        method: 'POST',
+        skipAuth: true,
+      });
+      if (data && data.access_token) {
+        const updatedUser: UserProfile = {
+          ...DEMO_USERS[role],
+          token: data.access_token,
+        };
+        setCurrentUser(updatedUser);
+        if (typeof window !== 'undefined') {
+          localStorage.setItem('aicte_auth_token', data.access_token);
+        }
+        return;
+      }
+    } catch (e: any) {
+      if (e?.status === 403) {
+        console.warn('Role switching is disabled in production (DEMO_MODE=False).');
+        return;
+      }
+      console.warn('Demo token endpoint unreachable, using local demo user', e);
+    }
     setCurrentUser(DEMO_USERS[role]);
   };
 
@@ -227,12 +362,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const advanceVirtualDays = async (days: number) => {
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/v1/demo/time-travel', {
+      const data = await apiFetch<any>('/api/v1/demo/time-travel', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ days_to_advance: days }),
       });
-      const data = await res.json();
+      // CRITICAL: Update displayed virtual date ONLY AFTER backend call succeeds!
       setVirtualDaysOffset((prev) => prev + days);
 
       // Add live escalation notification from backend response
@@ -246,17 +380,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         read: false,
       };
       setNotifications((curr) => [newNotif, ...curr]);
-    } catch (e) {
+    } catch (e: any) {
       console.error('Time travel API call error', e);
-      setVirtualDaysOffset((prev) => prev + days);
+      // DO NOT update virtual date on failure
     }
   };
 
   const resetVirtualTime = async () => {
     try {
-      await fetch('http://127.0.0.1:8000/api/v1/demo/time-travel/reset', { method: 'POST' });
-    } catch (e) {}
-    setVirtualDaysOffset(0);
+      await apiFetch('/api/v1/demo/time-travel/reset', { method: 'POST' });
+      // Update displayed date ONLY AFTER backend call succeeds!
+      setVirtualDaysOffset(0);
+    } catch (e: any) {
+      console.error('Time travel reset error', e);
+    }
   };
 
   const markNotificationAsRead = (id: string) => {
@@ -297,6 +434,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         loginAsPersona,
         loginWithToken,
         logout,
+        isDemoMode,
+        setIsDemoMode,
+        evaluatorMode,
+        setEvaluatorMode,
+        toggleEvaluatorMode,
+        selectedApplicationId,
+        setSelectedApplicationId,
+        openCaseDocket,
       }}
     >
       {children}

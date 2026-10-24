@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { useApp } from '@/lib/app-context';
+import { apiFetch, API_BASE } from '@/lib/api';
 import {
   CalendarCheck,
   MapPin,
@@ -15,6 +16,8 @@ import {
   Video,
   FileCheck2,
   X,
+  Calendar,
+  ShieldAlert,
 } from 'lucide-react';
 
 export const EVCView: React.FC = () => {
@@ -32,11 +35,18 @@ export const EVCView: React.FC = () => {
   const [geoLat, setGeoLat] = useState(12.9716);
   const [geoLng, setGeoLng] = useState(77.5946);
 
+  const getAuthHeaders = () => {
+    const token = currentUser.token || (typeof window !== 'undefined' ? localStorage.getItem('aicte_auth_token') : '') || '';
+    return {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    };
+  };
+
   const fetchQueue = async () => {
     try {
       setLoading(true);
-      const res = await fetch(`http://127.0.0.1:8000/api/v1/evc/queue?region_code=${currentRegion.code}`);
-      const data = await res.json();
+      const data = await apiFetch<any>(`/api/v1/evc/queue?region_code=${currentRegion.code}`);
       setQueue(data.queue || []);
       if (data.queue && data.queue.length > 0 && !selectedCase) {
         setSelectedCase(data.queue[0]);
@@ -50,12 +60,10 @@ export const EVCView: React.FC = () => {
 
   const fetchSmartProposal = async (appId: string) => {
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/v1/evc/suggest-panel', {
+      const data = await apiFetch<any>('/api/v1/evc/suggest-panel', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ application_id: appId, proposed_date: '2026-10-30', mode: 'ON_SITE' }),
       });
-      const data = await res.json();
       setSmartProposal(data);
     } catch (err) {
       console.error('Failed to fetch smart proposal', err);
@@ -76,24 +84,14 @@ export const EVCView: React.FC = () => {
   const handleConfirmSchedule = async () => {
     if (!selectedCase) return;
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/v1/evc/${selectedCase.application_id}/confirm`, {
+      const data = await apiFetch<any>(`/api/v1/evc/${selectedCase.application_id}/confirm`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-user-id': currentUser.id,
-          'x-user-role': currentUser.role,
-        },
         body: JSON.stringify({ selected_member_ids: ['exp-01', 'exp-02', 'exp-03'] }),
       });
-      const data = await res.json();
-      if (res.ok) {
-        alert(`EVC Panel officially confirmed for ${data.scheduled_date}! Stamped in audit ledger.`);
-        fetchQueue();
-      } else {
-        alert(`Confirmation Failed: ${data.detail}`);
-      }
-    } catch (err) {
-      alert('Error confirming EVC schedule.');
+      alert(`EVC Panel officially confirmed for ${data.scheduled_date}! Stamped in audit ledger.`);
+      fetchQueue();
+    } catch (err: any) {
+      alert(`Confirmation Failed: ${err?.message || 'Error confirming EVC schedule.'}`);
     }
   };
 
@@ -101,13 +99,8 @@ export const EVCView: React.FC = () => {
   const handleSubmitReport = async () => {
     if (!selectedCase) return;
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/v1/evc/reports/${selectedCase.application_id}/submit`, {
+      const data = await apiFetch<any>(`/api/v1/evc/reports/${selectedCase.application_id}/submit`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-user-id': currentUser.id,
-          'x-user-role': 'COMMITTEE_MEMBER',
-        },
         body: JSON.stringify({
           recommendation,
           inspection_summary: summaryText,
@@ -116,16 +109,11 @@ export const EVCView: React.FC = () => {
           geo_lng: geoLng,
         }),
       });
-      const data = await res.json();
-      if (res.ok) {
-        alert(`Geotagged EVC Report submitted with verdict [${data.recommendation}]! Advanced to Executive Committee.`);
-        setShowReportModal(false);
-        fetchQueue();
-      } else {
-        alert(`Report submission failed: ${data.detail}`);
-      }
-    } catch (err) {
-      alert('Error submitting report.');
+      alert(`Geotagged EVC Report submitted with verdict [${data.recommendation}]! Advanced to Executive Committee.`);
+      setShowReportModal(false);
+      fetchQueue();
+    } catch (err: any) {
+      alert(`Report submission failed: ${err?.message || 'Error submitting report.'}`);
     }
   };
 
@@ -242,16 +230,51 @@ export const EVCView: React.FC = () => {
 
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                     {smartProposal.suggested_panel.map((exp: any) => (
-                      <div key={exp.id} className="p-3 bg-slate-50 rounded-lg border border-ink-line text-xs space-y-1">
-                        <div className="font-bold text-ink-strong">{exp.name}</div>
+                      <div key={exp.id} className="p-3 bg-slate-50 rounded-lg border border-ink-line text-xs space-y-1.5">
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold text-ink-strong">{exp.name}</span>
+                          <span className="text-[10px] font-bold bg-white text-ink px-1.5 py-0.5 rounded border border-slate-200">
+                            {exp.state}
+                          </span>
+                        </div>
                         <div className="text-[10px] text-blossom-600 font-semibold">{exp.role_in_panel}</div>
                         <div className="text-[11px] text-ink-muted">{exp.expertise}</div>
-                        <div className="mt-1 pt-1 border-t border-slate-200 text-[10px] text-mint-700 font-bold flex items-center gap-1">
-                          <CheckCircle2 className="w-3 h-3" /> No Conflict of Interest
+                        {exp.inclusion_rationale && (
+                          <div className="text-[10px] text-ink-muted bg-white p-1.5 rounded border border-slate-200 italic leading-snug">
+                            {exp.inclusion_rationale}
+                          </div>
+                        )}
+                        <div className="mt-1 pt-1 border-t border-slate-200 text-[10px] text-mint-700 font-bold flex items-center justify-between">
+                          <span className="flex items-center gap-1">
+                            <CheckCircle2 className="w-3 h-3" /> No Conflict
+                          </span>
+                          <span className="text-ink-muted font-normal font-mono">
+                            Load: {exp.workload_active_visits || 0} visits
+                          </span>
                         </div>
                       </div>
                     ))}
                   </div>
+
+                  {/* Excluded Candidates Strip */}
+                  {smartProposal.excluded_candidates && smartProposal.excluded_candidates.length > 0 && (
+                    <div className="p-3 bg-roseState-100/20 rounded-lg border border-roseState-700/20 text-xs space-y-2">
+                      <div className="flex items-center gap-1.5 font-bold text-roseState-700">
+                        <ShieldAlert className="w-3.5 h-3.5" />
+                        <span>Excluded Candidates (Conflict Prevention & Cooling Enforcement):</span>
+                      </div>
+                      <div className="space-y-1">
+                        {smartProposal.excluded_candidates.map((exc: any, ei: number) => (
+                          <div key={ei} className="flex flex-wrap items-center justify-between gap-2 text-[11px] bg-white p-2 rounded border border-roseState-700/10">
+                            <span className="font-semibold text-ink-strong">{exc.name}</span>
+                            <span className="text-roseState-700 font-mono text-[10px] bg-roseState-100/50 px-1.5 py-0.5 rounded">
+                              {exc.reason}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                   <div className="text-[10px] text-ink-muted bg-white p-2 rounded border border-slate-200 flex items-center gap-2">
                     <ShieldCheck className="w-3.5 h-3.5 text-mint-700 shrink-0" />
@@ -261,13 +284,23 @@ export const EVCView: React.FC = () => {
 
                 {/* Actions Bar */}
                 <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3">
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <button
                       onClick={handleConfirmSchedule}
                       className="btn-primary !text-xs !py-1.5"
                     >
                       <CheckCircle2 className="w-3.5 h-3.5" /> Confirm Panel & Schedule (HUMAN-ONLY)
                     </button>
+                    {selectedCase.panel_id && (
+                      <a
+                        href={`${API_BASE}/api/v1/evc/schedule/${selectedCase.panel_id}/ics`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="btn-secondary !text-xs !py-1.5 text-ink border-ink-line hover:bg-slate-100 flex items-center gap-1.5"
+                      >
+                        <Calendar className="w-3.5 h-3.5 text-blossom-600" /> Export .ics Calendar Invite
+                      </a>
+                    )}
                     <button
                       onClick={() => setShowReportModal(true)}
                       className="btn-secondary !text-xs !py-1.5 text-blossom-600 border-blossom-300 hover:bg-blossom-100"

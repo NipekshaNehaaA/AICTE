@@ -64,6 +64,7 @@ class Institution(Base):
     category = Column(String(100), nullable=False) # Engineering & Tech, Management, etc.
     status = Column(String(50), default="ACTIVE") # ACTIVE, SUSPENDED, DEFICIENT
     compliance_health_score = Column(Float, default=100.0) # 0 to 100
+    preferred_language = Column(String(10), default="en") # en, hi, ta
     is_synthetic = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -82,9 +83,14 @@ class User(Base):
     System Users with RBAC and Regional/Institutional Scope.
     Roles:
       - INSTITUTION_USER: Restricted to own institution
-      - REGIONAL_OFFICER: Restricted to own region
-      - COMMITTEE_MEMBER: Restricted to assigned cases
-      - BUREAU_OFFICER / SUPER_ADMIN: Pan-India read; cannot approve own cases (SoD)
+      - REGIONAL_OFFICER: Dealing officer restricted to own region
+      - REGIONAL_DIRECTOR: Regional Director (assumed escalation level)
+      - BUREAU_OFFICER: Bureau Dealing Officer
+      - BUREAU_HEAD: Bureau Head (assumed escalation level)
+      - SCRUTINY_MEMBER: Scrutiny Committee member
+      - COMMITTEE_MEMBER: EVC expert panel member
+      - SAC_SHC_MEMBER: Standing Appellate / Standing Hearing Committee member
+      - SUPER_ADMIN: Member Secretary / Council Authority (Pan-India read, SoD guarded)
       - AUDITOR: Read-only everywhere (no write access)
     """
     __tablename__ = "users"
@@ -102,6 +108,14 @@ class User(Base):
     failed_login_attempts = Column(Integer, default=0)
     locked_until = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
+    email_verified = Column(Boolean, default=True)
+    verification_token = Column(String(100), nullable=True)
+    reset_password_token = Column(String(100), nullable=True)
+    reset_token_expires_at = Column(DateTime, nullable=True)
+    whatsapp_phone = Column(String(30), nullable=True)
+    opt_in_whatsapp = Column(Boolean, default=False)
+    preferred_language = Column(String(10), default="en") # en, hi, ta
+    preferred_channels = Column(String(100), default="IN_APP,EMAIL") # comma-separated
     created_at = Column(DateTime, default=datetime.utcnow)
 
     region = relationship("Region", back_populates="users")
@@ -357,6 +371,14 @@ class InstitutionalDocument(Base):
     verified_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    # Storage Metadata & Versioning
+    storage_path = Column(String(500), nullable=True) # relative path or MinIO object key
+    mime_type = Column(String(100), default="application/pdf")
+    original_filename = Column(String(255), nullable=True)
+    version = Column(Integer, default=1)
+    previous_version_id = Column(String(36), ForeignKey("institutional_documents.id"), nullable=True)
+    is_latest_version = Column(Boolean, default=True)
+
     institution = relationship("Institution", back_populates="documents")
     doc_type = relationship("DocumentType")
 
@@ -448,8 +470,14 @@ class Notification(Base):
     is_read = Column(Boolean, default=False)
     application_id = Column(String(36), nullable=True)
     escalation_level = Column(String(50), nullable=True) # L1_OFFICER, L2_REGIONAL_HEAD, L3_BUREAU_HEAD, L4_MEMBER_SECRETARY
-    delivery_channel = Column(String(30), default="IN_APP") # IN_APP, EMAIL_MOCK, SMS_MOCK
-    delivery_status = Column(String(20), default="DELIVERED")
+    delivery_channel = Column(String(30), default="IN_APP") # IN_APP, EMAIL, WHATSAPP_SANDBOX, SMS_SIMULATED
+    delivery_status = Column(String(30), default="DELIVERED") # QUEUED, DELIVERED, READ, FAILED, DEFERRED_QUIET_HOURS, SIMULATED
+    recipient_contact = Column(String(100), nullable=True) # email, mobile, or whatsapp handle
+    language = Column(String(10), default="en") # en, hi, ta
+    idempotency_key = Column(String(200), unique=True, nullable=True, index=True)
+    receipt_id = Column(String(100), nullable=True)
+    retry_count = Column(Integer, default=0)
+    error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -491,6 +519,39 @@ class AuditTrail(Base):
     timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class DailyMerkleRoot(Base):
+    """
+    Sealed daily Merkle root over audit ledger entries.
+    Provides outsider-verifiable proof of historical audit integrity.
+    """
+    __tablename__ = "daily_merkle_roots"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    root_date = Column(Date, unique=True, nullable=False, index=True)
+    merkle_root_hash = Column(String(64), nullable=False)
+    chain_head_hash = Column(String(64), nullable=False)
+    total_entries = Column(Integer, nullable=False)
+    first_entry_id = Column(Integer, nullable=False)
+    last_entry_id = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ExportedReportRegistry(Base):
+    """
+    Registry of generated PDF/Excel reports with SHA-256 hash and audit chain head.
+    Permits public verification without revealing sensitive applicant data.
+    """
+    __tablename__ = "exported_reports_registry"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    report_hash_sha256 = Column(String(64), nullable=False, index=True)
+    report_type = Column(String(100), nullable=False)
+    format = Column(String(20), nullable=False)
+    audit_chain_head = Column(String(64), nullable=False)
+    records_count = Column(Integer, default=0)
+    generated_at = Column(DateTime, default=datetime.utcnow)
+
+
 class DocumentAnomaly(Base):
     """
     Flags suspicious document submissions (e.g. duplicate SHA-256 hash across two institutions).
@@ -511,7 +572,7 @@ class DocumentAnomaly(Base):
 
 class HolidayCalendar(Base):
     """
-    Working days & statutory holidays calendar.
+    Working days & official holidays calendar.
     SLA clocks pause on holidays.
     """
     __tablename__ = "holidays_calendar"
@@ -521,3 +582,29 @@ class HolidayCalendar(Base):
     name = Column(String(100), nullable=False)
     is_national = Column(Boolean, default=True)
     region_id = Column(String(36), ForeignKey("regions.id"), nullable=True)
+
+
+class AcademicCalendar(Base):
+    """
+    Admin-entered Public Notice & Academic Calendar.
+    Enforces real calendar cutoffs per APH Clause 1.8 & Clause 2.25:
+    - Last date for application submission
+    - Scrutiny / EVC / SAC target completion dates
+    - Extension of Approval (EoA) absolute cutoff date (Clause 2.25j)
+    - Council ratification meeting date
+    """
+    __tablename__ = "academic_calendar"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    academic_year = Column(String(20), unique=True, nullable=False, default="2026-2027")
+    public_notice_date = Column(Date, nullable=False)
+    portal_open_date = Column(Date, nullable=False)
+    portal_close_date = Column(Date, nullable=False)
+    scrutiny_cutoff_date = Column(Date, nullable=False)
+    evc_cutoff_date = Column(Date, nullable=False)
+    sac_appeal_cutoff_date = Column(Date, nullable=False)
+    eoa_final_cutoff_date = Column(Date, nullable=False) # Clause 2.25(j): No EoA granted after this date
+    council_ratification_date = Column(Date, nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+

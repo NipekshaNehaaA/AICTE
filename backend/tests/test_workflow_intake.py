@@ -26,16 +26,19 @@ def test_aph_table_2_3_pipeline_determination():
     assert eoa_pipe["requires_scrutiny"] is False
     assert eoa_pipe["requires_evc"] is False
 
-    # 2. New Institution -> SCRUTINY_EVC
+    # 2. New Institution -> Scrutiny + EVC + SAC/SHC
     new_inst_pipe = APHRulesEngine.determine_pipeline("NEW_INSTITUTION")
-    assert new_inst_pipe["pipeline_name"] == "SCRUTINY_EVC"
+    assert new_inst_pipe["pipeline_name"] in ("SCRUTINY_EVC", "SCRUTINY_EVC_SAC")
+    assert new_inst_pipe["route"] == "Scrutiny + EVC + SAC/SHC (as applicable)"
     assert new_inst_pipe["requires_scrutiny"] is True
     assert new_inst_pipe["requires_evc"] is True
 
-    # 3. Increase in Intake -> SCRUTINY_EVC_SAC
+    # 3. Increase in Intake -> SCRUTINY_EVC_SAC (SAC shown only for appeals)
     intake_pipe = APHRulesEngine.determine_pipeline("INCREASE_INTAKE")
     assert intake_pipe["pipeline_name"] == "SCRUTINY_EVC_SAC"
-    assert intake_pipe["requires_sac"] is True
+    assert intake_pipe["requires_sac"] is False  # SAC applies ONLY for appeals per Table 2.3 & Clause 1.11
+    assert "SAC_HEARING" not in intake_pipe["stages"]  # Never shown universally
+    assert "SAC_HEARING" in APHRulesEngine.build_route_stage_path("INCREASE_INTAKE", is_appeal=True)
 
     # 4. Closure of Institution -> ONLY_SCRUTINY
     closure_pipe = APHRulesEngine.determine_pipeline("CLOSURE")

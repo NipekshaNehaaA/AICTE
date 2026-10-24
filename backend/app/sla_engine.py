@@ -163,7 +163,7 @@ class SLAEngine:
         )
         db.add(esc_entry)
 
-        # Dispatch Multi-Channel Notifications (In-App, Email Mock, SMS Mock)
+        # Dispatch Multi-Channel Notifications (In-App, Email Mock, SMS Mock, WhatsApp Mock)
         scheduled_time = app.sla_deadline
         actual_send_time = current_virtual_time
 
@@ -172,20 +172,27 @@ class SLAEngine:
             f"({app.institution.name}). Escalated to {target_tier} in accordance with APH 2024-27 escalation ladder."
         )
 
-        notif = Notification(
-            user_id=recipient_id,
-            title=f"SLA Breach Escalation: {target_tier}",
-            message=msg_body,
-            category="ESCALATION",
-            severity="CRITICAL",
-            scheduled_for=scheduled_time,
-            fired_at=actual_send_time,
-            application_id=app.id,
-            escalation_level=target_tier,
-            delivery_channel="IN_APP",
-            delivery_status="DELIVERED",
-        )
-        db.add(notif)
+        channels = [
+            ("IN_APP", "Direct Portal Session"),
+            ("EMAIL_MOCK", f"officer.{target_role.lower()}@aicte-india.org"),
+            ("SMS_MOCK", "+91-9876543210"),
+            ("WHATSAPP_MOCK", "+91-9876543210"),
+        ]
+        for ch, contact in channels:
+            db.add(Notification(
+                user_id=recipient_id,
+                title=f"SLA Breach Escalation: {target_tier}",
+                message=msg_body,
+                category="ESCALATION",
+                severity="CRITICAL",
+                scheduled_for=scheduled_time,
+                fired_at=actual_send_time,
+                application_id=app.id,
+                escalation_level=target_tier,
+                delivery_channel=ch,
+                delivery_status="DELIVERED",
+                recipient_contact=contact,
+            ))
 
         # Append Case Event
         db.add(CaseEvent(

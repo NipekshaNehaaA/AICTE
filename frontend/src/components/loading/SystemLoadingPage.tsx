@@ -57,21 +57,21 @@ export const SystemLoadingPage: React.FC<SystemLoadingPageProps> = ({ onComplete
     {
       id: 'step-4',
       label: 'Dynamic SLA & Expiry Timers',
-      detail: 'Clause 1.8(f) deficiency pause clock active',
+      detail: 'Deficiency pause clock active (design choice, configurable)',
       threshold: 76,
       icon: <Activity className="w-4 h-4 text-amberState-700" />,
     },
     {
       id: 'step-5',
       label: 'SHA-256 Cryptographic Ledger',
-      detail: 'Merkle hash chain continuous & tamper-evident',
+      detail: 'Cryptographic hash chain continuous & tamper-evident',
       threshold: 90,
       icon: <Database className="w-4 h-4 text-blossom-700" />,
     },
     {
       id: 'step-6',
-      label: 'AICTE Copilot & TreeSHAP XAI',
-      detail: 'APH clause RAG core & explainable attribution',
+      label: 'AICTE Copilot & Weighted Risk Scoring',
+      detail: 'APH clause RAG core & factor attribution',
       threshold: 99,
       icon: <Sparkles className="w-4 h-4 text-blossom-600" />,
     },
@@ -146,6 +146,7 @@ export const SystemLoadingPage: React.FC<SystemLoadingPageProps> = ({ onComplete
             National Portal • APH 2024–27
           </span>
           <button
+            data-testid="skip-boot-button"
             onClick={handleManualSkip}
             className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-blossom-600 hover:bg-blossom-700 text-white flex items-center gap-1.5 shadow-soft transition-all"
           >
@@ -244,7 +245,7 @@ export const SystemLoadingPage: React.FC<SystemLoadingPageProps> = ({ onComplete
           <span>Statutory Authority Reserved: AICTE Approval Process Handbook (APH 2024–27)</span>
         </div>
         <div className="flex items-center gap-4 font-mono font-medium">
-          <span className="text-mint-700 font-bold">• DPDP Act 2023 Compliant</span>
+          <span className="text-mint-700 font-bold">• Designed with DPDP principles in mind</span>
           <span>• SHA-256 Ledger Verified</span>
         </div>
       </div>

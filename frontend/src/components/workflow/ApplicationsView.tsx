@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { useApp } from '@/lib/app-context';
+import { apiFetch } from '@/lib/api';
 import {
   FileText,
   Clock,
@@ -39,7 +40,7 @@ interface ApplicationItem {
 }
 
 export const ApplicationsView: React.FC = () => {
-  const { currentUser, currentRegion } = useApp();
+  const { currentUser, currentRegion, openCaseDocket } = useApp();
 
   const [applications, setApplications] = useState<ApplicationItem[]>([]);
   const [selectedAppId, setSelectedAppId] = useState<string | null>(null);
@@ -62,16 +63,18 @@ export const ApplicationsView: React.FC = () => {
   const [cureResponse, setCureResponse] = useState('');
 
   // Fetch applications
+  const getAuthHeaders = () => {
+    const token = currentUser.token || (typeof window !== 'undefined' ? localStorage.getItem('aicte_auth_token') : '') || '';
+    return {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    };
+  };
+
   const fetchApplications = async () => {
     try {
       setLoading(true);
-      const res = await fetch(`http://127.0.0.1:8000/api/v1/applications?region_code=${currentRegion.code}`, {
-        headers: {
-          'x-user-role': currentUser.role,
-          'x-region-id': currentRegion.code === 'SWRO' ? 'swro-id' : '',
-        },
-      });
-      const data = await res.json();
+      const data = await apiFetch<any>(`/api/v1/applications?region_code=${currentRegion.code}`);
       setApplications(data.applications || []);
       if (data.applications && data.applications.length > 0 && !selectedAppId) {
         setSelectedAppId(data.applications[0].id);
@@ -86,12 +89,7 @@ export const ApplicationsView: React.FC = () => {
   // Fetch single application details
   const fetchDetails = async (id: string) => {
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/v1/applications/${id}`, {
-        headers: {
-          'x-user-role': currentUser.role,
-        },
-      });
-      const data = await res.json();
+      const data = await apiFetch<any>(`/api/v1/applications/${id}`);
       setAppDetails(data);
     } catch (err) {
       console.error('Failed to fetch details', err);
@@ -112,24 +110,14 @@ export const ApplicationsView: React.FC = () => {
   const handleAdvance = async () => {
     if (!selectedAppId) return;
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/v1/workflow/${selectedAppId}/advance`, {
+      const data = await apiFetch<any>(`/api/v1/workflow/${selectedAppId}/advance`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-user-id': currentUser.id,
-          'x-user-role': currentUser.role,
-        },
       });
-      const data = await res.json();
-      if (res.ok) {
-        alert(`Stage advanced to: ${data.new_stage}`);
-        fetchApplications();
-        fetchDetails(selectedAppId);
-      } else {
-        alert(`Advance Failed: ${data.detail || 'SoD or Permission violation'}`);
-      }
-    } catch (err) {
-      alert('Error advancing stage.');
+      alert(`Stage advanced to: ${data.new_stage}`);
+      fetchApplications();
+      fetchDetails(selectedAppId);
+    } catch (err: any) {
+      alert(`Advance Failed: ${err?.message || 'SoD or Permission violation'}`);
     }
   };
 
@@ -137,31 +125,21 @@ export const ApplicationsView: React.FC = () => {
   const handleRevert = async () => {
     if (!selectedAppId) return;
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/v1/workflow/${selectedAppId}/revert`, {
+      await apiFetch<any>(`/api/v1/workflow/${selectedAppId}/revert`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-user-id': currentUser.id,
-          'x-user-role': currentUser.role,
-        },
         body: JSON.stringify({
           reason_category: revertCategory,
           deficiency_remarks: revertRemarks || 'Document non-compliant with APH Chapter VI standards.',
-          aph_clause_ref: 'Chapter I, Clause 1.8(f) & Annexure-1 (Page 7, 77)',
+          aph_clause_ref: 'Chapter I, Clause 1.8 & Annexure-1 (deficiency cure window: design choice, configurable)',
           cure_days: 15,
         }),
       });
-      const data = await res.json();
-      if (res.ok) {
-        alert('Application returned for deficiency. Statutory SLA clock paused.');
-        setShowRevertModal(false);
-        fetchApplications();
-        fetchDetails(selectedAppId);
-      } else {
-        alert(`Revert Failed: ${data.detail}`);
-      }
-    } catch (err) {
-      alert('Error reverting application.');
+      alert('Application returned for deficiency. SLA clock paused (design choice, configurable).');
+      setShowRevertModal(false);
+      fetchApplications();
+      fetchDetails(selectedAppId);
+    } catch (err: any) {
+      alert(`Revert Failed: ${err?.message || 'Error reverting application.'}`);
     }
   };
 
@@ -169,28 +147,18 @@ export const ApplicationsView: React.FC = () => {
   const handleCureSubmit = async () => {
     if (!selectedAppId) return;
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/v1/workflow/${selectedAppId}/cure-submit`, {
+      await apiFetch<any>(`/api/v1/workflow/${selectedAppId}/cure-submit`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-user-id': currentUser.id,
-          'x-user-role': 'INSTITUTION_USER',
-        },
         body: JSON.stringify({
           institution_response: cureResponse || 'Uploaded renewed compliance documents with digital verification.',
         }),
       });
-      const data = await res.json();
-      if (res.ok) {
-        alert('Clarification submitted. Statutory SLA clock resumed!');
-        setShowCureModal(false);
-        fetchApplications();
-        fetchDetails(selectedAppId);
-      } else {
-        alert(`Submit Failed: ${data.detail}`);
-      }
-    } catch (err) {
-      alert('Error submitting cure.');
+      alert('Clarification submitted. Statutory SLA clock resumed!');
+      setShowCureModal(false);
+      fetchApplications();
+      fetchDetails(selectedAppId);
+    } catch (err: any) {
+      alert(`Submit Failed: ${err?.message || 'Error submitting cure.'}`);
     }
   };
 
@@ -198,22 +166,13 @@ export const ApplicationsView: React.FC = () => {
   const handleGenerateAIDraft = async () => {
     if (!selectedAppId) return;
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/v1/workflow/${selectedAppId}/draft-summary`, {
+      const data = await apiFetch<any>(`/api/v1/workflow/${selectedAppId}/draft-summary`, {
         method: 'POST',
-        headers: {
-          'x-user-id': currentUser.id,
-          'x-user-role': currentUser.role,
-        },
       });
-      const data = await res.json();
-      if (res.ok) {
-        setCurrentAIDraft(data);
-        setShowAIDraftModal(true);
-      } else {
-        alert(`AI Draft Failed: ${data.detail}`);
-      }
-    } catch (err) {
-      alert('Error generating draft summary.');
+      setCurrentAIDraft(data);
+      setShowAIDraftModal(true);
+    } catch (err: any) {
+      alert(`AI Draft Failed: ${err?.message || 'Error generating draft summary.'}`);
     }
   };
 
@@ -221,24 +180,13 @@ export const ApplicationsView: React.FC = () => {
   const handleApproveAIDraft = async () => {
     if (!currentAIDraft) return;
     try {
-      // Use different approver to adhere to SoD
-      const approverId = currentUser.role === 'SUPER_ADMIN' ? currentUser.id : 'usr-sec-director-01';
-      const res = await fetch(`http://127.0.0.1:8000/api/v1/workflow/ai-drafts/${currentAIDraft.draft_id}/approve`, {
+      await apiFetch<any>(`/api/v1/workflow/ai-drafts/${currentAIDraft.draft_id}/approve`, {
         method: 'POST',
-        headers: {
-          'x-user-id': approverId,
-          'x-user-role': 'SUPER_ADMIN',
-        },
       });
-      const data = await res.json();
-      if (res.ok) {
-        alert('AI Draft officially approved by Competent Authority and stamped in immutable audit trail!');
-        setShowAIDraftModal(false);
-      } else {
-        alert(`Approval Failed: ${data.detail}`);
-      }
-    } catch (err) {
-      alert('Error approving AI draft.');
+      alert('AI Draft officially approved by Competent Authority and stamped in immutable audit trail!');
+      setShowAIDraftModal(false);
+    } catch (err: any) {
+      alert(`Approval Failed: ${err?.message || 'Error approving AI draft.'}`);
     }
   };
 
@@ -371,20 +319,31 @@ export const ApplicationsView: React.FC = () => {
                     </div>
                   </div>
 
-                  {/* SLA Countdown Clock */}
-                  <div className="text-right bg-slate-50 p-2.5 rounded-lg border border-ink-line">
-                    <div className="text-[10px] uppercase font-bold text-ink-muted flex items-center gap-1 justify-end">
-                      <Clock className="w-3 h-3 text-blossom-600" /> Statutory SLA Clock
-                    </div>
-                    <div className="text-sm font-bold text-ink-strong mt-0.5">
-                      {appDetails.sla.is_paused ? (
-                        <span className="text-amberState-700">PAUSED (Deficiency Cure)</span>
-                      ) : (
-                        `${appDetails.sla.days_remaining} Days Remaining`
-                      )}
-                    </div>
-                    <div className="text-[10px] text-ink-muted mt-0.5">
-                      Target Deadline: {appDetails.sla.deadline}
+                  {/* Actions & SLA Countdown Clock */}
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={() => openCaseDocket(appDetails.id)}
+                      className="btn-primary !text-xs flex items-center gap-1.5 shadow-soft"
+                      title="Open comprehensive single case docket"
+                    >
+                      <FileText className="w-4 h-4" />
+                      <span>Open Full Docket</span>
+                    </button>
+
+                    <div className="text-right bg-slate-50 p-2.5 rounded-lg border border-ink-line">
+                      <div className="text-[10px] uppercase font-bold text-ink-muted flex items-center gap-1 justify-end">
+                        <Clock className="w-3 h-3 text-blossom-600" /> Statutory SLA Clock
+                      </div>
+                      <div className="text-sm font-bold text-ink-strong mt-0.5">
+                        {appDetails.sla.is_paused ? (
+                          <span className="text-amberState-700">PAUSED (Deficiency Cure)</span>
+                        ) : (
+                          `${appDetails.sla.days_remaining} Days Remaining`
+                        )}
+                      </div>
+                      <div className="text-[10px] text-ink-muted mt-0.5">
+                        Target Deadline: {appDetails.sla.deadline}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -584,16 +543,17 @@ export const ApplicationsView: React.FC = () => {
               <button onClick={() => setShowSubmitModal(false)} className="btn-secondary !text-xs">Cancel</button>
               <button
                 onClick={async () => {
-                  const instId = appDetails ? appDetails.institution.id : 'inst-01';
-                  const res = await fetch('http://127.0.0.1:8000/api/v1/applications/submit', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ institution_id: instId, application_type: newAppType }),
-                  });
-                  if (res.ok) {
+                  try {
+                    const instId = appDetails ? appDetails.institution.id : 'inst-01';
+                    await apiFetch<any>('/api/v1/applications/submit', {
+                      method: 'POST',
+                      body: JSON.stringify({ institution_id: instId, application_type: newAppType }),
+                    });
                     alert('Application successfully submitted and auto-routed!');
                     setShowSubmitModal(false);
                     fetchApplications();
+                  } catch (err: any) {
+                    alert(`Submission failed: ${err?.message || 'Unknown error'}`);
                   }
                 }}
                 className="btn-primary !text-xs"
@@ -637,13 +597,13 @@ export const ApplicationsView: React.FC = () => {
                   rows={3}
                   value={revertRemarks}
                   onChange={(e) => setRevertRemarks(e.target.value)}
-                  placeholder="Record mandatory statutory reasons as required under APH Clause 1.8(f)..."
+                  placeholder="Record deficiency reasons as per APH norms (cure window: design choice, configurable)..."
                   className="w-full p-2 bg-slate-50 border border-ink-line rounded-lg text-xs"
                 />
               </div>
 
               <div className="bg-amberState-100 p-2.5 rounded-lg border border-amberState-700/20 text-[11px] text-amberState-700">
-                <strong>Statutory Rule:</strong> Reverting will pause the SLA clock and give the institution a 15-day cure window.
+                <strong>Workflow Rule:</strong> Reverting will pause the SLA clock and give the institution a 15-day cure window (design choice, configurable).
               </div>
             </div>
 

@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Application, Institution, LLMDraft, User, TimeBoundUndertaking, InstitutionalDocument
 from app.scoped_dal import ScopedDAL, RequestContext
+from app.auth import get_request_context
 
 router = APIRouter(prefix="/api/v1/copilot", tags=["Compliance & APH Copilot"])
 
@@ -59,20 +60,20 @@ APH_KNOWLEDGE_BASE = [
     {
         "keywords": ["cure", "deficiency", "scrutiny", "revert", "rectification", "resubmit", "1.8"],
         "topic": "Scrutiny Deficiency & Rectification Cure Window",
-        "clause": "APH 2024-27, Chapter I, Clause 1.8(f) & 1.8(g)",
-        "page": "34-36",
+        "clause": "APH 2024-27, Chapter I, Clause 1.8 & 1.8(g)",
+        "page": "22-23",
         "answer": (
-            "### Statutory Procedure for Scrutiny Deficiencies (Clause 1.8)\n\n"
-            "Under **APH 2024-27 Chapter I, Clause 1.8(f)**, when the Scrutiny Committee notes deficiencies in an application:\n\n"
+            "### Procedure for Scrutiny Deficiencies (Clause 1.8)\n\n"
+            "Under **APH 2024-27 Chapter I, Clause 1.8**, when the Scrutiny Committee notes deficiencies in an application:\n\n"
             "1. **Deficiency Communication:** The Scrutiny Committee issues a formal Deficiency Memo citing the specific non-compliances.\n"
-            "2. **Cure Window:** The institution is granted a statutory period (**15 working days**, sample value configurable) to rectify documents and submit compliance evidence online.\n"
-            "3. **SLA Clock Freeze:** The statutory processing SLA clock is **automatically paused** during this cure window. Days spent by the institution rectifying deficiencies do not penalize the AICTE Regional Office.\n"
-            "4. **Re-Scrutiny (Clause 1.8(g)):** Upon online resubmission by the institution, the application routes automatically to **Re-Scrutiny**, where an authorized committee re-verifies the rectified documents.\n\n"
-            "> **Statutory Rule:** Only one chance for rectification is permitted during preliminary scrutiny unless specifically approved by the Competent Authority."
+            "2. **Cure Window:** The institution is granted a cure window (15 working days — design choice, configurable) to rectify documents and submit compliance evidence online.\n"
+            "3. **SLA Clock Freeze:** The processing SLA clock is paused during this cure period (design choice, configurable). Days spent by the institution rectifying deficiencies do not penalize the AICTE Regional Office.\n"
+            "4. **Re-Scrutiny (Clause 1.8(g)):** Upon online resubmission by the institution, the application routes automatically to **Re-Scrutiny**, where an authorized committee verifies ONLY the deficiencies pointed out during preliminary scrutiny.\n\n"
+            "> **Rule:** Only one chance for rectification is permitted during preliminary scrutiny unless specifically approved by the Competent Authority."
         ),
         "citations": [
-            {"clause": "Clause 1.8(f)", "page": "35", "topic": "Deficiency Memo & Cure Timeline"},
-            {"clause": "Clause 1.8(g)", "page": "36", "topic": "Re-Scrutiny Process"},
+            {"clause": "Clause 1.8", "page": "22", "topic": "Deficiency Memo & Scrutiny Process"},
+            {"clause": "Clause 1.8(g)", "page": "23", "topic": "Re-Scrutiny Process"},
             {"clause": "Table 2.3", "page": "30", "topic": "Application Processing Pipelines"}
         ],
         "followups": [
@@ -280,8 +281,7 @@ def get_suggested_prompts():
 @router.post("/chat", response_model=ChatResponse)
 def copilot_chat(
     payload: ChatRequest,
-    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
-    x_user_role: Optional[str] = Header("INSTITUTION_USER", alias="X-User-Role"),
+    ctx: RequestContext = Depends(get_request_context),
     db: Session = Depends(get_db),
 ):
     """
@@ -293,10 +293,11 @@ def copilot_chat(
     q_lower = user_query.lower()
     session_id = str(uuid.uuid4())
 
-    # 1. Check if query is about a specific application in database
+    # 1. Check if query is about a specific application in database (Scoped via ScopedDAL)
     app_context = None
     if payload.application_id:
-        app = db.query(Application).filter(Application.id == payload.application_id).first()
+        dal = ScopedDAL(db, ctx)
+        app = dal.get_application_by_id(payload.application_id)
         if app:
             app_context = {
                 "application_no": app.application_no,
@@ -309,17 +310,11 @@ def copilot_chat(
                 "days_remaining": round((app.sla_deadline - datetime.utcnow()).total_seconds() / 86400.0, 1),
             }
 
-    # 2. Knowledge Base Semantic Matching
-    best_match = None
-    max_keyword_matches = 0
+    # 2. Statistical Probabilistic BM25 Retrieval over APH Handbook Chunks
+    from app.retrieval import aph_bm25_retriever
+    retrieved = aph_bm25_retriever.retrieve(user_query, top_k=2, min_score=0.8)
 
-    for item in APH_KNOWLEDGE_BASE:
-        matches = sum(1 for kw in item["keywords"] if kw in q_lower)
-        if matches > max_keyword_matches:
-            max_keyword_matches = matches
-            best_match = item
-
-    # 3. Construct Tailored Grounded Response
+    # 3. Construct Grounded Response
     if app_context and ("my application" in q_lower or "status" in q_lower or "stage" in q_lower or "docket" in q_lower):
         # Case-specific grounded response
         answer = (
@@ -335,7 +330,7 @@ def copilot_chat(
         )
         citations = [
             {"clause": "Table 2.3", "page": "30", "topic": f"Pipeline for {app_context['pipeline']}"},
-            {"clause": "Clause 1.8", "page": "34", "topic": f"Procedures for {app_context['stage']}"}
+            {"clause": "Clause 1.8", "page": "22", "topic": f"Procedures for {app_context['stage']}"}
         ]
         confidence = 0.96
         followups = [
@@ -343,31 +338,45 @@ def copilot_chat(
             "How do I upload compliance evidence if deficiency is noted?",
             "Who is the current assigned officer for my application?"
         ]
-    elif best_match and max_keyword_matches >= 1:
-        answer = best_match["answer"]
-        citations = best_match["citations"]
-        confidence = 0.94
-        followups = best_match["followups"]
-    else:
-        # Grounded general fallback
+    elif retrieved:
+        # Grounded response synthesised strictly from retrieved chunks
+        top_chunk, score = retrieved[0]
+        chunk_content = top_chunk["content"]
+        topic = top_chunk["topic"]
+        clause = top_chunk["clause"]
+        page = top_chunk["page"]
+
         answer = (
-            "### AICTE Approval Process Handbook (APH 2024-25 to 2026-27) Guidance\n\n"
-            f"Regarding your query on **\"{user_query}\"**:\n\n"
-            "Under the statutory regulations of AICTE APH 2024-27:\n"
-            "- All technical institutions must satisfy the mandatory minimum norms laid down in **Chapter I & II** (Administrative Processing) and **Chapter VI** (Land, Built-up Area, and Infrastructure Norms).\n"
-            "- Processing follows the deterministic stage sequences specified in **Table 2.3** (Scrutiny, EVC, SAC/SHC).\n"
-            "- All statutory deadlines operate on working business days and pause during formal deficiency cure periods.\n\n"
-            "> **Recommendation:** Please refer to the specific chapter requirements or select one of the suggested statutory topics below for detailed clause-level guidance."
+            f"### Statutory Guidance: {topic}\n\n"
+            f"Based strictly on retrieved statutory evidence from **APH 2024-27 {clause} (Page {page})**:\n\n"
+            f"{chunk_content}\n\n"
+            f"> **Authority Boundary Note:** This answer is generated from verified AICTE Handbook clauses. "
+            f"Official regulatory determinations are reserved exclusively for the Competent Authority."
         )
         citations = [
-            {"clause": "APH 2024-27 General", "page": "1-231", "topic": "Approval Regulations & Norms"},
-            {"clause": "Table 2.3", "page": "30", "topic": "Processing Stages by Application Category"}
+            {"clause": c[0]["clause"], "page": str(c[0]["page"]), "topic": c[0]["topic"]}
+            for c in retrieved
         ]
-        confidence = 0.88
+        confidence = min(0.98, max(0.85, round(0.85 + (score / 20.0), 2)))
         followups = [
-            "What is the statutory cure window if scrutiny notes deficiencies?",
-            "What are the land lease deed requirements for approval?",
-            "What are the mandatory qualifications for EVC committee inspectors?"
+            "What are the processing stages under APH Table 2.3?",
+            "How do working-day calendars affect statutory deadlines?",
+            "Who has authority to sign off on compliance rectifications?"
+        ]
+    else:
+        # Weak evidence guard: answer "not found in APH" instead of guessing
+        answer = (
+            "not found in APH. The requested query could not be verified with sufficient certainty in the official "
+            "AICTE Approval Process Handbook (2024-27). As an AICTE compliance copilot operating under strict regulatory "
+            "governance, answers are provided ONLY when grounded in verified handbook citations. "
+            "Please check the spelling of your query or consult the official APH Handbook catalog."
+        )
+        citations = []
+        confidence = 0.0
+        followups = [
+            "What is the cure window and procedure for scrutiny deficiencies?",
+            "What are the land lease deed requirements under Clause 6.17?",
+            "What are the EVC committee panel rules?",
         ]
 
     # Append case context note if application context is attached
@@ -386,7 +395,7 @@ def copilot_chat(
             confidence_score=confidence,
             source_citations=str([c["clause"] for c in citations]),
             status="INFORMATIONAL_ONLY",
-            requester_id=x_user_id or "ANONYMOUS_STAKEHOLDER",
+            requester_id=ctx.user_id or "ANONYMOUS_STAKEHOLDER",
             created_at=datetime.utcnow(),
         )
         db.add(draft)

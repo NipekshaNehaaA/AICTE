@@ -1,5 +1,5 @@
 """
-Unit tests for AICTE Compliance & APH Copilot and TreeSHAP Explainability (SIH26262).
+Unit tests for AICTE Compliance & APH Copilot and weighted risk score with per-factor contributions (SIH26262).
 """
 
 import sys
@@ -19,7 +19,7 @@ def db():
     session.close()
 
 def test_copilot_suggested_prompts():
-    """Verify that statutory suggested prompts are available for quick 1-click evaluation."""
+    """Verify that suggested prompts are available for quick 1-click evaluation."""
     data = get_suggested_prompts()
     assert "suggested_prompts" in data
     assert len(data["suggested_prompts"]) >= 5
@@ -53,30 +53,33 @@ def test_copilot_case_specific_context(db):
     assert resp.context_data is not None
     assert resp.context_data["application_no"] == app_record.application_no
 
-def test_shap_explanation_waterfall(db):
-    """Verify that TreeSHAP attribution returns valid Shapley values conforming to f(x) = E[f(x)] + sum(phi)."""
+def test_risk_score_factor_contributions_waterfall(db):
+    """Verify that priority scorer returns weighted risk score with per-factor contributions."""
     app_record = db.query(Application).first()
     assert app_record is not None, "Need at least one seeded application"
 
     data = get_single_app_shap(application_id=app_record.id, db=db)
-    assert "TreeSHAP" in data["model_type"]
+    assert "weighted risk score with per-factor contributions" in data["model_type"].lower()
+    assert "weighted risk score with per-factor contributions" in data["scorer_name"].lower()
+    assert "factor_contributions" in data
     assert "base_value" in data
-    assert data["base_value"] == 0.35 # 35% empirical baseline
+    assert data["base_value"] == 0.35 # 35% baseline
     assert len(data["features"]) >= 4
 
     for feat in data["features"]:
         assert "feature" in feat
-        assert "shap_contribution" in feat
+        assert "factor_name" in feat
+        assert "factor_contribution" in feat
         assert "impact" in feat
         assert feat["impact"] in ["INCREASES_RISK", "REDUCES_RISK"]
 
-def test_next_best_action_embedded_shap(db):
-    """Verify that the Next-Best-Action queue items include embedded SHAP feature breakdowns."""
+def test_next_best_action_embedded_risk_factors(db):
+    """Verify that the Next-Best-Action queue items include embedded risk factor contribution breakdowns."""
     data = get_next_best_action_queue(region_code="SWRO", db=db)
     assert "queue" in data
     if len(data["queue"]) > 0:
         first = data["queue"][0]
-        assert "shap_attribution" in first
-        shap = first["shap_attribution"]
-        assert "features" in shap
-        assert len(shap["features"]) >= 3
+        assert "factor_contributions" in first or "shap_attribution" in first
+        factors = first.get("factor_breakdown") or first["shap_attribution"]
+        assert "features" in factors
+        assert len(factors["features"]) >= 3

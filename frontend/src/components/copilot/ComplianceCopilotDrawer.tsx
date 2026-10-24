@@ -14,6 +14,8 @@ import {
   HelpCircle,
   ExternalLink,
 } from 'lucide-react';
+import { useApp } from '@/lib/app-context';
+import { apiFetch } from '@/lib/api';
 
 interface Citation {
   clause: string;
@@ -59,14 +61,14 @@ export const ComplianceCopilotDrawer: React.FC = () => {
     },
   ]);
 
+  const { currentUser } = useApp();
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Fetch suggested prompts on mount
   useEffect(() => {
-    fetch('http://127.0.0.1:8000/api/v1/copilot/suggested-prompts')
-      .then((res) => res.json())
+    apiFetch<{ suggested_prompts: string[] }>('/api/v1/copilot/suggested-prompts')
       .then((data) => {
-        if (data.suggested_prompts) {
+        if (data?.suggested_prompts) {
           setSuggestedPrompts(data.suggested_prompts);
         }
       })
@@ -96,20 +98,12 @@ export const ComplianceCopilotDrawer: React.FC = () => {
     setLoading(true);
 
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/v1/copilot/chat', {
+      const data = await apiFetch<any>('/api/v1/copilot/chat', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-User-Role': 'INSTITUTION_USER',
-        },
         body: JSON.stringify({
           message: textToSend.trim(),
         }),
       });
-
-      if (!res.ok) throw new Error('Failed to get copilot response');
-
-      const data = await res.json();
       const botMsg: Message = {
         id: `bot-${Date.now()}`,
         sender: 'copilot',

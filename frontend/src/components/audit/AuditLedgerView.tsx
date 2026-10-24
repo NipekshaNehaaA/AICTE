@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import { apiFetch } from '@/lib/api';
 import {
   History,
   ShieldCheck,
@@ -11,21 +12,25 @@ import {
   Search,
   ExternalLink,
   QrCode,
+  RefreshCw,
+  FolderOpen,
 } from 'lucide-react';
 
 export const AuditLedgerView: React.FC = () => {
   const [entries, setEntries] = useState<any[]>([]);
   const [verificationResult, setVerificationResult] = useState<any | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const fetchAuditTrail = async () => {
     try {
       setLoading(true);
-      const res = await fetch('http://127.0.0.1:8000/api/v1/audit/trail?limit=40');
-      const data = await res.json();
-      setEntries(data.entries || []);
-    } catch (err) {
+      setError(null);
+      const data = await apiFetch<any>('/api/v1/audit/trail?limit=40');
+      setEntries(data?.entries || []);
+    } catch (err: any) {
       console.error('Failed to fetch audit trail', err);
+      setError(err.message || 'Failed to retrieve immutable audit ledger.');
     } finally {
       setLoading(false);
     }
@@ -33,33 +38,33 @@ export const AuditLedgerView: React.FC = () => {
 
   const verifyChain = async () => {
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/v1/audit/verify-chain', { method: 'POST' });
-      const data = await res.json();
+      const data = await apiFetch<any>('/api/v1/audit/verify-chain', { method: 'POST' });
       setVerificationResult(data);
-    } catch (err) {
-      alert('Error verifying audit chain.');
+    } catch (err: any) {
+      console.error('Error verifying audit chain', err);
     }
   };
 
   const simulateTampering = async () => {
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/v1/audit/simulate-tampering', { method: 'POST' });
-      const data = await res.json();
+      await apiFetch('/api/v1/audit/simulate-tampering', { method: 'POST' });
       alert('Tampering simulated: A historical hash was modified. Click "Verify Chain Integrity" to see detection.');
       fetchAuditTrail();
       verifyChain();
-    } catch (err) {
-      alert('Error simulating tampering.');
+    } catch (err: any) {
+      alert(`Error simulating tampering: ${err.message}`);
     }
   };
 
   const restoreChain = async () => {
     try {
-      await fetch('http://127.0.0.1:8000/api/v1/audit/restore-chain', { method: 'POST' });
+      await apiFetch('/api/v1/audit/restore-chain', { method: 'POST' });
       alert('Audit hash chain restored to valid state.');
       fetchAuditTrail();
       verifyChain();
-    } catch (err) {}
+    } catch (err: any) {
+      alert(`Error restoring chain: ${err.message}`);
+    }
   };
 
   useEffect(() => {
@@ -144,12 +149,47 @@ export const AuditLedgerView: React.FC = () => {
         </div>
       )}
 
-      {/* Audit Entries Table */}
-      <div className="bg-white rounded-xl border border-ink-line shadow-soft overflow-hidden">
-        <div className="p-3 bg-slate-50 border-b border-ink-line font-bold text-xs text-ink-strong flex items-center justify-between">
-          <span>Audit Ledger Entries ({entries.length})</span>
-          <span className="text-[10px] text-ink-muted">SHA-256 Chained</span>
+      {/* Loading State */}
+      {loading && (
+        <div className="p-8 bg-white rounded-xl border border-ink-line text-center shadow-soft">
+          <RefreshCw className="w-7 h-7 text-blossom-600 animate-spin mx-auto mb-2" />
+          <h3 className="text-xs font-bold text-ink-strong">Synchronizing Cryptographic Audit Trail...</h3>
+          <p className="text-[11px] text-ink-muted mt-0.5">Fetching SHA-256 chained transaction blocks.</p>
         </div>
+      )}
+
+      {/* Error State */}
+      {error && !loading && (
+        <div className="p-4 bg-rose-50 rounded-xl border border-rose-200 text-center shadow-soft">
+          <AlertTriangle className="w-6 h-6 text-rose-600 mx-auto mb-1.5" />
+          <h3 className="text-xs font-bold text-rose-900">Failed to Retrieve Audit Ledger</h3>
+          <p className="text-[11px] text-rose-700 max-w-md mx-auto mt-0.5 mb-3">{error}</p>
+          <button
+            onClick={fetchAuditTrail}
+            className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-lg shadow-sm inline-flex items-center gap-1.5 transition-colors"
+          >
+            <RefreshCw className="w-3 h-3" />
+            Retry
+          </button>
+        </div>
+      )}
+
+      {/* Empty State */}
+      {!loading && !error && entries.length === 0 && (
+        <div className="p-8 bg-white rounded-xl border border-ink-line text-center shadow-soft">
+          <FolderOpen className="w-8 h-8 text-slate-400 mx-auto mb-2" />
+          <h3 className="text-xs font-bold text-ink-strong">No Audit Records Found</h3>
+          <p className="text-[11px] text-ink-muted mt-0.5">No logged transactions found within current scope.</p>
+        </div>
+      )}
+
+      {/* Audit Entries Table */}
+      {!loading && !error && entries.length > 0 && (
+        <div className="bg-white rounded-xl border border-ink-line shadow-soft overflow-hidden">
+          <div className="p-3 bg-slate-50 border-b border-ink-line font-bold text-xs text-ink-strong flex items-center justify-between">
+            <span>Audit Ledger Entries ({entries.length})</span>
+            <span className="text-[10px] text-ink-muted">SHA-256 Chained</span>
+          </div>
 
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs font-mono">
@@ -193,6 +233,7 @@ export const AuditLedgerView: React.FC = () => {
           </table>
         </div>
       </div>
+      )}
     </div>
   );
 };

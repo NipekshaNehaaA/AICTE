@@ -2,8 +2,12 @@
 
 import React from 'react';
 import { ShieldAlert, Info, Sparkles } from 'lucide-react';
+import { useApp } from '@/lib/app-context';
 
 export const StatutoryBanner: React.FC = () => {
+  const { isDemoMode, evaluatorMode } = useApp();
+  const showSampleValues = evaluatorMode || isDemoMode;
+
   return (
     <div className="bg-white border-b border-ink-line px-6 py-2 flex flex-wrap items-center justify-between text-xs text-ink gap-2">
       {/* Left: Statutory Safeguard Banner */}
@@ -18,9 +22,11 @@ export const StatutoryBanner: React.FC = () => {
 
       {/* Right: Sample Value Badge & AI draft note */}
       <div className="flex items-center gap-2">
-        <span className="badge-sample-value flex items-center gap-1" title="Values can be compiled directly from APH 2024-27 PDF">
-          <Info className="w-3 h-3 text-amber-700" /> Sample values, configurable
-        </span>
+        {showSampleValues && (
+          <span className="badge-sample-value flex items-center gap-1" title="Values can be compiled directly from APH 2024-27 PDF">
+            <Info className="w-3 h-3 text-amber-700" /> Sample values, configurable
+          </span>
+        )}
         <span className="bg-slate-100 text-ink-muted text-[11px] px-2 py-0.5 rounded font-medium flex items-center gap-1 border border-ink-line">
           <Sparkles className="w-3 h-3 text-blossom-600" /> AI drafts require named human approval
         </span>

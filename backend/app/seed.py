@@ -38,6 +38,7 @@ from app.models import (
     HolidayCalendar,
     AuditTrail,
     DocumentAnomaly,
+    AcademicCalendar,
 )
 
 # Set deterministic random seed for repeatable demos
@@ -83,15 +84,13 @@ def seed_database():
     init_db()
     db: Session = SessionLocal()
 
-    # Clear existing data for clean demo seed
+    # Clear and sync schema for clean demo seed
     try:
-        if db.query(Region).count() > 0:
-            print("Database already has records. Resetting for fresh deterministic seed...")
-            for table in reversed(db.get_bind().table_names()):
-                db.execute(f"DELETE FROM {table}")
-            db.commit()
-    except Exception:
-        pass
+        from app.database import Base
+        Base.metadata.drop_all(bind=db.get_bind())
+        Base.metadata.create_all(bind=db.get_bind())
+    except Exception as e:
+        print("Schema sync warning:", e)
 
     print("--- 1. Seeding Configurable Regions (Sample List) ---")
     regions_map = {}
@@ -173,23 +172,45 @@ def seed_database():
     admin_user = User(
         email="member.secretary@aicte-india.org",
         password_hash=default_pw_hash,
-        full_name="Prof. Rajive Kumar (Member Secretary)",
+        full_name="Dr. Arvind Ramanathan (Member Secretary)",
         role="SUPER_ADMIN",
         region_id=None,
         mfa_enabled=True,
     )
     db.add(admin_user)
 
+    # Bureau Head (HQ - Assumed Escalation Level L3)
+    bureau_head_user = User(
+        email="bureau.head@aicte-india.org",
+        password_hash=default_pw_hash,
+        full_name="Dr. M. S. Jayaprakash (Bureau Head, Assumed Escalation)",
+        role="BUREAU_HEAD",
+        region_id=None,
+        mfa_enabled=True,
+    )
+    db.add(bureau_head_user)
+
     # Bureau Officer (HQ)
     bureau_user = User(
         email="approval.bureau@aicte-india.org",
         password_hash=default_pw_hash,
-        full_name="Shri Anand Sharma (Director, Approval Bureau)",
+        full_name="Shri Anand K. Sharma (Approval Bureau Officer)",
         role="BUREAU_OFFICER",
         region_id=None,
         mfa_enabled=True,
     )
     db.add(bureau_user)
+
+    # SAC / SHC Appellate Committee Member (Pan-India)
+    sac_user = User(
+        email="sac.appellate@aicte-india.org",
+        password_hash=default_pw_hash,
+        full_name="Justice (Retd.) K. V. Narayanan (SAC Member)",
+        role="SAC_SHC_MEMBER",
+        region_id=None,
+        mfa_enabled=False,
+    )
+    db.add(sac_user)
 
     # Statutory Auditor (HQ - Read Only)
     auditor_user = User(
@@ -205,6 +226,7 @@ def seed_database():
 
     # Regional Officers & Committee Members for each of the 7 regions
     ro_users_map = {}
+    rd_users_map = {}
     committee_users_map = {}
     for code, reg in regions_map.items():
         ro_user = User(
@@ -219,6 +241,18 @@ def seed_database():
         db.flush()
         ro_users_map[code] = ro_user
 
+        rd_user = User(
+            email=f"rd.{code.lower()}@aicte-india.org",
+            password_hash=default_pw_hash,
+            full_name=f"Dr. Regional Director ({code} - Assumed Escalation)",
+            role="REGIONAL_DIRECTOR",
+            region_id=reg.id,
+            mfa_enabled=True,
+        )
+        db.add(rd_user)
+        db.flush()
+        rd_users_map[code] = rd_user
+
         cm_user = User(
             email=f"expert.{code.lower()}@aicte-india.org",
             password_hash=default_pw_hash,
@@ -230,6 +264,18 @@ def seed_database():
         db.add(cm_user)
         db.flush()
         committee_users_map[code] = cm_user
+
+        # Scrutiny Committee Member
+        scrutiny_user = User(
+            email=f"scrutiny.{code.lower()}@aicte-india.org",
+            password_hash=default_pw_hash,
+            full_name=f"Prof. Scrutiny Member ({code})",
+            role="SCRUTINY_MEMBER",
+            region_id=reg.id,
+            mfa_enabled=False,
+        )
+        db.add(scrutiny_user)
+        db.flush()
 
     print("--- 6. Seeding 210 Synthetic Technical Institutions (30 per Region) ---")
     institutions_list = []
@@ -306,8 +352,8 @@ def seed_database():
         pipe_type = pipeline_types[i % len(pipeline_types)]
         app_no = f"AICTE/2026-27/{inst.permanent_id}"
 
-        # SLA calculation (sample value, configurable)
-        sla_deadline = now + timedelta(days=random.randint(2, 14))
+        # SLA calculation (realistic baseline: statutory 25-50 days per APH 2024-27)
+        sla_deadline = now + timedelta(days=random.randint(25, 50))
         sla_status = "ON_TRACK"
 
         app = Application(
@@ -325,7 +371,7 @@ def seed_database():
             approver_id=None,
             sla_deadline=sla_deadline,
             sla_status=sla_status,
-            submitted_at=now - timedelta(days=random.randint(1, 10)),
+            submitted_at=now - timedelta(days=random.randint(1, 8)),
         )
         db.add(app)
         db.flush()
@@ -338,7 +384,7 @@ def seed_database():
             status="ACTIVE",
             started_at=app.submitted_at,
             due_at=sla_deadline,
-            sla_days_allotted=7, # sample value, configurable
+            sla_days_allotted=21, # realistic statutory scrutiny timeline
         )
         db.add(stage)
 
@@ -390,18 +436,29 @@ def seed_database():
             status="FIRED",
             fired_at=now - timedelta(days=1),
         ))
-        db.add(Notification(
-            user_id=ro_users_map["SWRO"].id,
-            title="SLA Breach Escalation (Level 2)",
-            message=f"Application {app_edge_2.application_no} exceeded statutory timeline by 4 days. Escalated to Regional Officer.",
-            category="ESCALATION",
-            severity="CRITICAL",
-            scheduled_for=now,
-            fired_at=now,
-            is_read=False,
-            application_id=app_edge_2.id,
-            escalation_level="L2_REGIONAL_HEAD",
-        ))
+        # Multi-Channel notification delivery logs (In-App, Email Mock, SMS Mock, WhatsApp Mock)
+        channels = [
+            ("IN_APP", "Direct Portal Session"),
+            ("EMAIL_MOCK", "ro.swro@aicte-india.org"),
+            ("SMS_MOCK", "+91-9876543210"),
+            ("WHATSAPP_MOCK", "+91-9876543210"),
+        ]
+        for ch, contact in channels:
+            db.add(Notification(
+                user_id=ro_users_map["SWRO"].id,
+                title="SLA Breach Escalation (Level 2)",
+                message=f"Application {app_edge_2.application_no} exceeded statutory timeline by 4 days. Escalated to Regional Director.",
+                category="ESCALATION",
+                severity="CRITICAL",
+                scheduled_for=now,
+                fired_at=now,
+                is_read=False,
+                application_id=app_edge_2.id,
+                escalation_level="L2_REGIONAL_HEAD",
+                delivery_channel=ch,
+                delivery_status="DELIVERED",
+                recipient_contact=contact,
+            ))
 
     # EDGE CASE 3: Expired Lease Deed (Expired 12 days ago)
     edge_inst_3 = institutions_list[2]
@@ -582,6 +639,21 @@ def seed_database():
         ip_address="127.0.0.1",
     )
     db.add(init_audit)
+
+    # Seed Admin-Entered Public Notice & Academic Calendar (Clause 1.8 & 2.25)
+    academic_cal = AcademicCalendar(
+        academic_year="2026-2027",
+        public_notice_date=date(2026, 1, 15),
+        portal_open_date=date(2026, 2, 1),
+        portal_close_date=date(2026, 3, 15),
+        scrutiny_cutoff_date=date(2026, 4, 15),
+        evc_cutoff_date=date(2026, 5, 10),
+        sac_appeal_cutoff_date=date(2026, 5, 25),
+        eoa_final_cutoff_date=date(2026, 6, 10), # Clause 2.25(j): No EoA granted after this cutoff
+        council_ratification_date=date(2026, 6, 30),
+        is_active=True,
+    )
+    db.add(academic_cal)
 
     db.commit()
     db.close()

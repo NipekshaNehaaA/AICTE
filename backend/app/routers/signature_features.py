@@ -11,12 +11,14 @@ Features:
 =============================================================================
 """
 
+import os
+import json
 import hashlib
 import uuid
 import re
 from datetime import datetime, timedelta, date
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.database import get_db
@@ -31,6 +33,7 @@ from app.models import (
     InstitutionalDocument,
 )
 from app.scoped_dal import ScopedDAL, RequestContext, SecurityScopeError, SoDViolationError
+from app.auth import get_request_context
 from app.rules_engine import APH_CLAUSE_CATALOG, APH_PIPELINE_MAP
 
 router = APIRouter(prefix="/api/v1/differentiators", tags=["Signature Differentiators"])
@@ -46,60 +49,65 @@ class WhatIfRequest(BaseModel):
 class NLPQueryRequest(BaseModel):
     plain_text_query: str
 
-def get_request_context(
-    x_user_id: Optional[str] = Header(None),
-    x_user_role: Optional[str] = Header("REGIONAL_OFFICER"),
-    x_region_id: Optional[str] = Header(None),
-) -> RequestContext:
-    return RequestContext(
-        user_id=x_user_id or "usr-demo-default",
-        role=x_user_role or "REGIONAL_OFFICER",
-        region_id=x_region_id,
-    )
+from app.auth import get_request_context
 
 # -----------------------------------------------------------------------------
-# 1. APH-TO-RULES COMPILER WITH PROVENANCE
+# 1. APH-TO-RULES COMPILER WITH PROVENANCE (Upload -> LLM Draft -> Admin Diff -> Human Approval -> Versioned Activation)
 # -----------------------------------------------------------------------------
-@router.post("/aph-compiler")
-def compile_aph_handbook(
-    payload: CompileAPHRequest,
+_cached_local_pdf_pages = None
+
+def _get_local_aph_pages() -> Dict[int, str]:
+    global _cached_local_pdf_pages
+    if _cached_local_pdf_pages is not None:
+        return _cached_local_pdf_pages
+    import pypdf
+    local_pdf = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "Approval process handbook.pdf"))
+    if os.path.exists(local_pdf):
+        reader = pypdf.PdfReader(local_pdf)
+        _cached_local_pdf_pages = {idx + 1: page.extract_text() or "" for idx, page in enumerate(reader.pages)}
+    else:
+        _cached_local_pdf_pages = {}
+    return _cached_local_pdf_pages
+
+@router.post("/aph-compiler/upload")
+async def upload_aph_and_generate_draft(
+    file: Optional[UploadFile] = File(None),
+    edition: str = Form("2024-25 to 2026-27"),
     ctx: RequestContext = Depends(get_request_context),
     db: Session = Depends(get_db),
 ):
     """
-    Parses uploaded APH 2024-27 text and drafts versioned YAML ruleset with exact clause provenance.
-    Writes strictly to `llm_drafts` table. Requires human officer approval to activate.
+    Step 1 & 2 of APH Compiler Workflow:
+    Uploads official APH handbook PDF, extracts text (page-aware), and generates verified LLM Draft ruleset.
+    Flow: upload -> LLM draft -> admin diff -> human approval -> versioned activation.
     """
-    compiled_yaml = """# AICTE APH 2024-25 to 2026-27 Ruleset
-cycle: 2024-2027
-provenance: "AICTE Approval Process Handbook 2024-25 to 2026-27"
-routing_rules:
-  EXTENSION_OF_APPROVAL:
-    pipeline: ONLY_SELF_DISCLOSURE
-    clause: "Chapter II, Clause 2.5 (Page 15)"
-  NEW_INSTITUTION:
-    pipeline: SCRUTINY_EVC
-    clause: "Chapter I, Clause 1.8 & 1.9 (Pages 7-8)"
-  INCREASE_INTAKE:
-    pipeline: SCRUTINY_EVC_SAC
-    clause: "Chapter II, Clause 2.6(j) & Table 2.3 (Pages 17, 30)"
-land_norms:
-  lease_minimum_years: 30
-  clause: "Chapter II Clause 2.1(e) & Chapter VI Clause 6.17(a) (Pages 12, 56)"
-appeal_window:
-  sac_appeal_days: 7
-  clause: "Chapter I Clause 1.11(a) / Chapter II Clause 2.24(a) (Pages 9, 29)"
-"""
+    filename = file.filename if file else "Approval process handbook.pdf"
+    content_bytes = await file.read() if file else b""
+    
+    pdf_pages = {}
+    if content_bytes:
+        import io, pypdf
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(content_bytes))
+            pdf_pages = {idx + 1: page.extract_text() or "" for idx, page in enumerate(reader.pages)}
+        except Exception:
+            pdf_pages = {}
+
+    if not pdf_pages:
+        pdf_pages = _get_local_aph_pages()
+
+    from app.llm_adapter import llm_adapter
+    result = llm_adapter.extract_structured_rules(pdf_pages)
 
     draft = LLMDraft(
         draft_type="APH_RULE_DRAFT",
         related_entity_type="RULESET",
         related_entity_id="APH-2024-27-OFFICIAL",
-        prompt_hash=uuid.uuid4().hex,
-        model_version="hosted-llm-v1",
-        generated_content=compiled_yaml,
-        confidence_score=0.98,
-        source_citations="['Table 2.3 (p. 30)', 'Clause 1.8 (p. 7)', 'Clause 1.9 (p. 8)', 'Clause 2.1(e) (p. 12)', 'Clause 6.17(a) (p. 56)']",
+        prompt_hash=result["prompt_hash"],
+        model_version=result["model_name"],
+        generated_content=result["compiled_yaml"],
+        confidence_score=result["confidence_score"],
+        source_citations=json.dumps([f"{r['clause_id']} (p. {r['page_number']}) [{r.get('verification_status', 'UNVERIFIED')}]" for r in result["rules"]]),
         status="PENDING_HUMAN_REVIEW",
         requester_id=ctx.user_id,
     )
@@ -111,9 +119,101 @@ appeal_window:
         "draft_id": draft.id,
         "classification": "SUGGEST_ONLY",
         "notice": "AI draft. Decision reserved for the competent authority.",
+        "extractor_model": result["model_name"],
+        "is_offline_extractor": result["is_offline"],
         "confidence_score": draft.confidence_score,
-        "compiled_yaml": compiled_yaml,
+        "compiled_yaml": result["compiled_yaml"],
+        "rules": result["rules"],
+        "all_verified": result["all_verified"],
+        "workflow_step": "1-2. Uploaded and LLM Draft Created",
+        "filename": filename,
+        "file_size_bytes": len(content_bytes),
+    }
+
+@router.post("/aph-compiler")
+def compile_aph_handbook(
+    payload: CompileAPHRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+):
+    """
+    Parses APH 2024-27 handbook text and drafts versioned YAML ruleset with exact clause provenance.
+    Writes strictly to `llm_drafts` table. Requires human officer approval to activate.
+    """
+    pdf_pages = _get_local_aph_pages()
+
+    from app.llm_adapter import llm_adapter
+    result = llm_adapter.extract_structured_rules(pdf_pages)
+
+    draft = LLMDraft(
+        draft_type="APH_RULE_DRAFT",
+        related_entity_type="RULESET",
+        related_entity_id="APH-2024-27-OFFICIAL",
+        prompt_hash=result["prompt_hash"],
+        model_version=result["model_name"],
+        generated_content=result["compiled_yaml"],
+        confidence_score=result["confidence_score"],
+        source_citations=json.dumps([f"{r['clause_id']} (p. {r['page_number']}) [{r.get('verification_status', 'UNVERIFIED')}]" for r in result["rules"]]),
+        status="PENDING_HUMAN_REVIEW",
+        requester_id=ctx.user_id,
+    )
+    db.add(draft)
+    db.commit()
+
+    return {
+        "status": "COMPILATION_DRAFTED",
+        "draft_id": draft.id,
+        "classification": "SUGGEST_ONLY",
+        "notice": "AI draft. Decision reserved for the competent authority.",
+        "extractor_model": result["model_name"],
+        "is_offline_extractor": result["is_offline"],
+        "confidence_score": draft.confidence_score,
+        "compiled_yaml": result["compiled_yaml"],
+        "rules": result["rules"],
+        "all_verified": result["all_verified"],
         "clauses_extracted": list(APH_CLAUSE_CATALOG.values()),
+    }
+
+@router.get("/aph-compiler/{draft_id}/diff")
+def get_aph_compiler_diff(
+    draft_id: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Step 3 of APH Compiler Workflow:
+    Admin Diff: Compares LLM draft ruleset against currently active RuleVersion.
+    Flow: upload -> LLM draft -> admin diff -> human approval -> versioned activation.
+    """
+    import difflib
+    draft = db.query(LLMDraft).filter(LLMDraft.id == draft_id).first()
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found.")
+
+    active_rule = db.query(RuleVersion).filter(RuleVersion.is_active == True).first()
+    active_content = active_rule.raw_config_yaml if active_rule else "# Initial Genesis APH Ruleset\nversion: APH-GENESIS-2024\n"
+    draft_content = draft.generated_content or ""
+
+    diff_lines = list(difflib.unified_diff(
+        active_content.splitlines(keepends=True),
+        draft_content.splitlines(keepends=True),
+        fromfile=f"Active ({active_rule.version if active_rule else 'Genesis'})",
+        tofile=f"Draft ({draft.id[:8]})",
+    ))
+    diff_text = "".join(diff_lines)
+
+    return {
+        "status": "DIFF_GENERATED",
+        "draft_id": draft.id,
+        "active_version": active_rule.version if active_rule else "APH-GENESIS-2024",
+        "has_changes": len(diff_lines) > 0,
+        "diff_text": diff_text if diff_text else "No differences detected.",
+        "workflow_steps": [
+            "1. Upload APH Document",
+            "2. Generate LLM Draft Ruleset",
+            "3. Admin Diff Review (Current Step)",
+            "4. Human Officer Approval Gate",
+            "5. Versioned Activation in Database",
+        ],
     }
 
 @router.post("/aph-compiler/{draft_id}/approve")
@@ -123,16 +223,31 @@ def approve_compiled_aph_ruleset(
     db: Session = Depends(get_db),
 ):
     """
-    Human approval gate: Promotes compiled ruleset to the official active ruleset in DB.
-    Enforces pairwise SoD: requester_id != approver_id.
+    Human approval gate: Promotes compiled ruleset to official active ruleset in DB.
+    Enforces:
+    1. Automatic Verifier: UNVERIFIED rules cannot be approved.
+    2. Pairwise SoD: requester_id != approver_id.
     """
+    draft = db.query(LLMDraft).filter(LLMDraft.id == draft_id).first()
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found.")
+
+    # Guard: UNVERIFIED rules cannot be approved
+    if "UNVERIFIED" in (draft.generated_content or ""):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot approve ruleset: unverified rules detected. All rules must be VERIFIED against verbatim APH citations."
+        )
+
     dal = ScopedDAL(db, ctx)
     try:
         approved_draft = dal.approve_ai_draft(draft_id)
         
         # Activate in rule_versions
+        existing_count = db.query(RuleVersion).count()
+        ver_tag = f"V{existing_count + 1}-{uuid.uuid4().hex[:4].upper()}"
         rule_ver = RuleVersion(
-            version="APH-2024-27-OFFICIAL-V1",
+            version=f"APH-2024-27-OFFICIAL-{ver_tag}",
             title="Official Compiled APH 2024-27 Ruleset (Human Approved)",
             is_active=True,
             approved_by=ctx.user_id,
@@ -158,6 +273,7 @@ def approve_compiled_aph_ruleset(
 @router.get("/next-best-action")
 def get_next_best_action_queue(
     region_code: Optional[str] = None,
+    ctx: RequestContext = Depends(get_request_context),
     db: Session = Depends(get_db),
 ):
     """
@@ -165,24 +281,20 @@ def get_next_best_action_queue(
     Ranks each case by Priority Score = Breach Risk x Student Impact x Overdue Multiplier.
     Provides plain-language explainability for every ranking.
     """
-    query = db.query(Application).filter(Application.status.in_(["IN_PROGRESS", "ESCALATED"]))
+    dal = ScopedDAL(db, ctx)
+    apps = [a for a in dal.get_applications() if a.status in ("IN_PROGRESS", "ESCALATED")]
     if region_code:
-        query = query.join(Application.region).filter(Region.code == region_code)
+        apps = [a for a in apps if a.region and a.region.code == region_code]
 
-    apps = query.all()
     ranked = []
     now = datetime.utcnow()
 
     for app in apps:
-        # 1. Breach Risk: based on days remaining vs SLA
+        # 1. Deterministic Workload Forecast
+        from app.workload_forecasting import workload_engine
+        forecast = workload_engine.compute_workload_forecast(app, db, current_time=now)
+        breach_risk = max(0.20, forecast["breach_probability"])
         diff_days = (app.sla_deadline - now).total_seconds() / 86400.0
-        breach_risk = 0.3 # base
-        if diff_days < 0:
-            breach_risk = 0.95 # overdue
-        elif diff_days <= 2.0:
-            breach_risk = 0.75 # at risk
-        elif diff_days <= 5.0:
-            breach_risk = 0.50
 
         # 2. Student Impact: based on intake / application type
         intake_impact = 360 if app.application_type == "NEW_INSTITUTION" else 180 if app.application_type == "INCREASE_INTAKE" else 60
@@ -200,8 +312,8 @@ def get_next_best_action_queue(
         else:
             explanation = f"Routine: {round(diff_days, 1)} days remaining for {app.current_stage}."
 
-        # Compute SHAP feature attribution breakdown (Explainable AI / TreeSHAP)
-        shap_base = 0.35
+        # Compute feature attribution breakdown (weighted risk score with per-factor contributions)
+        base_risk_score = 0.35
         phi_days = +0.28 if diff_days < 0 else +0.22 if diff_days <= 2.0 else +0.10 if diff_days <= 5.0 else -0.08
         phi_pipeline = +0.12 if app.pipeline_type in ["SCRUTINY_EVC", "EVC_SAC_SHC"] else -0.05
         phi_intake = +0.14 if app.application_type == "NEW_INSTITUTION" else +0.08 if app.application_type == "INCREASE_INTAKE" else -0.04
@@ -209,52 +321,63 @@ def get_next_best_action_queue(
         reg_code = app.region.code if app.region else "SWRO"
         phi_region = +0.06 if reg_code in ["SWRO", "WRO", "SRO"] else -0.04
 
-        raw_shap_sum = shap_base + phi_days + phi_pipeline + phi_intake + phi_status + phi_region
-        scale_fac = (breach_risk - shap_base) / max(0.01, (raw_shap_sum - shap_base)) if abs(raw_shap_sum - shap_base) > 0.001 else 1.0
+        raw_factor_sum = base_risk_score + phi_days + phi_pipeline + phi_intake + phi_status + phi_region
+        scale_fac = (breach_risk - base_risk_score) / max(0.01, (raw_factor_sum - base_risk_score)) if abs(raw_factor_sum - base_risk_score) > 0.001 else 1.0
 
-        shap_breakdown = {
-            "model_type": "TreeSHAP (XGBoost BreachRisk-v2.4)",
-            "base_value": shap_base,
+        weighted_risk_breakdown = {
+            "model_type": "forecast from workload model",
+            "scorer_name": "weighted risk score with per-factor contributions",
+            "base_value": base_risk_score,
             "predicted_risk": breach_risk,
             "predicted_risk_percent": f"{int(breach_risk * 100)}%",
             "features": [
                 {
-                    "feature": "Statutory SLA Days Remaining",
+                    "feature": "Target SLA Days Remaining (Sample value, configurable)",
+                    "factor_name": "Target SLA Days Remaining (Sample value, configurable)",
                     "value": f"{round(diff_days, 1)}d",
                     "shap_contribution": round(phi_days * scale_fac, 3),
+                    "factor_contribution": round(phi_days * scale_fac, 3),
                     "impact": "INCREASES_RISK" if phi_days > 0 else "REDUCES_RISK",
                     "reason": f"Deadline proximity ({round(diff_days, 1)}d remaining)" if diff_days >= 0 else f"Overdue by {abs(int(diff_days))}d"
                 },
                 {
                     "feature": "Pipeline Multi-Stage Complexity",
+                    "factor_name": "Pipeline Multi-Stage Complexity",
                     "value": app.pipeline_type.replace('_', ' + '),
                     "shap_contribution": round(phi_pipeline * scale_fac, 3),
+                    "factor_contribution": round(phi_pipeline * scale_fac, 3),
                     "impact": "INCREASES_RISK" if phi_pipeline > 0 else "REDUCES_RISK",
                     "reason": "Requires on-site EVC inspection & committee quorum" if phi_pipeline > 0 else "Streamlined single-phase scrutiny"
                 },
                 {
                     "feature": "Student Intake Stake Volume",
+                    "factor_name": "Student Intake Stake Volume",
                     "value": f"{intake_impact} seats",
                     "shap_contribution": round(phi_intake * scale_fac, 3),
+                    "factor_contribution": round(phi_intake * scale_fac, 3),
                     "impact": "INCREASES_RISK" if phi_intake > 0 else "REDUCES_RISK",
                     "reason": "High student intake scrutiny" if phi_intake > 0 else "Routine seat count"
                 },
                 {
                     "feature": "Deficiency & Clock Pause History",
+                    "factor_name": "Deficiency & Clock Pause History",
                     "value": app.status,
                     "shap_contribution": round(phi_status * scale_fac, 3),
+                    "factor_contribution": round(phi_status * scale_fac, 3),
                     "impact": "INCREASES_RISK" if phi_status > 0 else "REDUCES_RISK",
                     "reason": "Active deficiency rectifications" if phi_status > 0 else "Clean first-pass submission"
                 },
                 {
                     "feature": "Regional Office Workload Pressure",
+                    "factor_name": "Regional Office Workload Pressure",
                     "value": reg_code,
                     "shap_contribution": round(phi_region * scale_fac, 3),
+                    "factor_contribution": round(phi_region * scale_fac, 3),
                     "impact": "INCREASES_RISK" if phi_region > 0 else "REDUCES_RISK",
                     "reason": f"{reg_code} regional corridor has >40 concurrent cases" if phi_region > 0 else f"{reg_code} corridor operates within normal capacity"
                 }
             ],
-            "statutory_note": "SHAP (SHapley Additive exPlanations) values provide mathematical explainability (XAI) for why this case was prioritized."
+            "transparency_note": "Forecast from workload model provides explainable triage for application priority."
         }
 
         ranked.append({
@@ -264,12 +387,24 @@ def get_next_best_action_queue(
             "application_type": app.application_type,
             "current_stage": app.current_stage,
             "priority_score": priority_score,
+            "weighted_risk_score": priority_score,
             "breach_risk": f"{int(breach_risk * 100)}%",
             "student_impact": intake_impact,
             "days_remaining": round(diff_days, 1),
+            "sla_deadline": app.sla_deadline.strftime("%Y-%m-%d"),
+            "sla_status": app.sla_status,
             "explanation": explanation,
             "recommended_action": f"Review {app.current_stage} documentation and sign off or revert with deficiencies.",
-            "shap_attribution": shap_breakdown,
+            "model_type": "forecast from workload model",
+            "model_label": "forecast from workload model",
+            "projected_completion_date": forecast["projected_completion_date"],
+            "projected_breach_date": forecast["projected_breach_date"],
+            "probability_band": forecast["probability_band"],
+            "breach_probability": forecast["breach_probability"],
+            "workload_assumptions": forecast["assumptions"],
+            "factor_contributions": weighted_risk_breakdown["features"],
+            "factor_breakdown": weighted_risk_breakdown,
+            "shap_attribution": weighted_risk_breakdown,
         })
 
     # Sort descending by priority score
@@ -279,19 +414,25 @@ def get_next_best_action_queue(
         "queue": ranked,
     }
 
+@router.get("/risk-explanation/{application_id}")
 @router.get("/shap-explanation/{application_id}")
-def get_single_app_shap(application_id: str, db: Session = Depends(get_db)):
-    """Returns granular SHAP attribution breakdown for an application to prove explainability (XAI)."""
-    app = db.query(Application).filter(Application.id == application_id).first()
+def get_single_app_risk_explanation(
+    application_id: str,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+):
+    """Returns granular weighted risk score attribution breakdown for an application to prove explainability."""
+    dal = ScopedDAL(db, ctx)
+    app = dal.get_application_by_id(application_id)
     if not app:
-        raise HTTPException(status_code=404, detail="Application not found")
+        raise HTTPException(status_code=404, detail="Application not found or outside user scope.")
 
     now = datetime.utcnow()
     diff_days = (app.sla_deadline - now).total_seconds() / 86400.0
     breach_risk = 0.95 if diff_days < 0 else 0.75 if diff_days <= 2.0 else 0.50 if diff_days <= 5.0 else 0.30
     intake_impact = 360 if app.application_type == "NEW_INSTITUTION" else 180 if app.application_type == "INCREASE_INTAKE" else 60
 
-    shap_base = 0.35
+    base_risk_score = 0.35
     phi_days = +0.28 if diff_days < 0 else +0.22 if diff_days <= 2.0 else +0.10 if diff_days <= 5.0 else -0.08
     phi_pipeline = +0.12 if app.pipeline_type in ["SCRUTINY_EVC", "EVC_SAC_SHC"] else -0.05
     phi_intake = +0.14 if app.application_type == "NEW_INSTITUTION" else +0.08 if app.application_type == "INCREASE_INTAKE" else -0.04
@@ -299,55 +440,89 @@ def get_single_app_shap(application_id: str, db: Session = Depends(get_db)):
     reg_code = app.region.code if app.region else "SWRO"
     phi_region = +0.06 if reg_code in ["SWRO", "WRO", "SRO"] else -0.04
 
-    raw_shap_sum = shap_base + phi_days + phi_pipeline + phi_intake + phi_status + phi_region
-    scale_fac = (breach_risk - shap_base) / max(0.01, (raw_shap_sum - shap_base)) if abs(raw_shap_sum - shap_base) > 0.001 else 1.0
+    raw_factor_sum = base_risk_score + phi_days + phi_pipeline + phi_intake + phi_status + phi_region
+    scale_fac = (breach_risk - base_risk_score) / max(0.01, (raw_factor_sum - base_risk_score)) if abs(raw_factor_sum - base_risk_score) > 0.001 else 1.0
+
+    features_list = [
+        {
+            "feature": "Target SLA Days Remaining (Sample value, configurable)",
+            "factor_name": "Target SLA Days Remaining (Sample value, configurable)",
+            "value": f"{round(diff_days, 1)}d",
+            "shap_contribution": round(phi_days * scale_fac, 3),
+            "factor_contribution": round(phi_days * scale_fac, 3),
+            "impact": "INCREASES_RISK" if phi_days > 0 else "REDUCES_RISK",
+            "reason": f"Deadline proximity ({round(diff_days, 1)}d remaining)" if diff_days >= 0 else f"Overdue by {abs(int(diff_days))}d"
+        },
+        {
+            "feature": "Pipeline Multi-Stage Complexity",
+            "factor_name": "Pipeline Multi-Stage Complexity",
+            "value": app.pipeline_type.replace('_', ' + '),
+            "shap_contribution": round(phi_pipeline * scale_fac, 3),
+            "factor_contribution": round(phi_pipeline * scale_fac, 3),
+            "impact": "INCREASES_RISK" if phi_pipeline > 0 else "REDUCES_RISK",
+            "reason": "Requires on-site EVC inspection & committee quorum" if phi_pipeline > 0 else "Streamlined single-phase scrutiny"
+        },
+        {
+            "feature": "Student Intake Stake Volume",
+            "factor_name": "Student Intake Stake Volume",
+            "value": f"{intake_impact} seats",
+            "shap_contribution": round(phi_intake * scale_fac, 3),
+            "factor_contribution": round(phi_intake * scale_fac, 3),
+            "impact": "INCREASES_RISK" if phi_intake > 0 else "REDUCES_RISK",
+            "reason": "High student intake scrutiny" if phi_intake > 0 else "Routine seat count"
+        },
+        {
+            "feature": "Deficiency & Clock Pause History",
+            "factor_name": "Deficiency & Clock Pause History",
+            "value": app.status,
+            "shap_contribution": round(phi_status * scale_fac, 3),
+            "factor_contribution": round(phi_status * scale_fac, 3),
+            "impact": "INCREASES_RISK" if phi_status > 0 else "REDUCES_RISK",
+            "reason": "Active deficiency rectifications" if phi_status > 0 else "Clean first-pass submission"
+        },
+        {
+            "feature": "Regional Office Workload Pressure",
+            "factor_name": "Regional Office Workload Pressure",
+            "value": reg_code,
+            "shap_contribution": round(phi_region * scale_fac, 3),
+            "factor_contribution": round(phi_region * scale_fac, 3),
+            "impact": "INCREASES_RISK" if phi_region > 0 else "REDUCES_RISK",
+            "reason": f"{reg_code} regional corridor has >40 concurrent cases" if phi_region > 0 else f"{reg_code} corridor operates within normal capacity"
+        }
+    ]
 
     return {
         "application_no": app.application_no,
         "institution_name": app.institution.name,
-        "model_type": "TreeSHAP (XGBoost BreachRisk-v2.4)",
-        "base_value": shap_base,
+        "model_type": "weighted risk score with per-factor contributions",
+        "scorer_name": "weighted risk score with per-factor contributions",
+        "base_value": base_risk_score,
         "predicted_risk": breach_risk,
         "predicted_risk_percent": f"{int(breach_risk * 100)}%",
-        "features": [
-            {
-                "feature": "Statutory SLA Days Remaining",
-                "value": f"{round(diff_days, 1)}d",
-                "shap_contribution": round(phi_days * scale_fac, 3),
-                "impact": "INCREASES_RISK" if phi_days > 0 else "REDUCES_RISK",
-                "reason": f"Deadline proximity ({round(diff_days, 1)}d remaining)" if diff_days >= 0 else f"Overdue by {abs(int(diff_days))}d"
-            },
-            {
-                "feature": "Pipeline Multi-Stage Complexity",
-                "value": app.pipeline_type.replace('_', ' + '),
-                "shap_contribution": round(phi_pipeline * scale_fac, 3),
-                "impact": "INCREASES_RISK" if phi_pipeline > 0 else "REDUCES_RISK",
-                "reason": "Requires on-site EVC inspection & committee quorum" if phi_pipeline > 0 else "Streamlined single-phase scrutiny"
-            },
-            {
-                "feature": "Student Intake Stake Volume",
-                "value": f"{intake_impact} seats",
-                "shap_contribution": round(phi_intake * scale_fac, 3),
-                "impact": "INCREASES_RISK" if phi_intake > 0 else "REDUCES_RISK",
-                "reason": "High student intake scrutiny" if phi_intake > 0 else "Routine seat count"
-            },
-            {
-                "feature": "Deficiency & Clock Pause History",
-                "value": app.status,
-                "shap_contribution": round(phi_status * scale_fac, 3),
-                "impact": "INCREASES_RISK" if phi_status > 0 else "REDUCES_RISK",
-                "reason": "Active deficiency rectifications" if phi_status > 0 else "Clean first-pass submission"
-            },
-            {
-                "feature": "Regional Office Workload Pressure",
-                "value": reg_code,
-                "shap_contribution": round(phi_region * scale_fac, 3),
-                "impact": "INCREASES_RISK" if phi_region > 0 else "REDUCES_RISK",
-                "reason": f"{reg_code} regional corridor has >40 concurrent cases" if phi_region > 0 else f"{reg_code} corridor operates within normal capacity"
-            }
-        ],
-        "statutory_note": "SHAP (SHapley Additive exPlanations) values prove why this case was prioritized."
+        "features": features_list,
+        "factor_contributions": features_list,
+        "transparency_note": "Weighted risk score with factor contributions provides explainable triage for application priority.",
+        "statutory_note": "Weighted risk score with per-factor contributions demonstrates why this case was prioritized."
     }
+
+get_single_app_shap = get_single_app_risk_explanation
+
+@router.get("/forecast/{application_id}")
+def get_single_app_forecast(
+    application_id: str,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+):
+    """
+    Returns deterministic workload forecast for a single application.
+    """
+    dal = ScopedDAL(db, ctx)
+    app = dal.get_application_by_id(application_id)
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found or outside user scope.")
+
+    from app.workload_forecasting import workload_engine
+    return workload_engine.compute_workload_forecast(app, db)
 
 # -----------------------------------------------------------------------------
 # 3. WHAT-IF SIMULATION LAB
@@ -355,32 +530,130 @@ def get_single_app_shap(application_id: str, db: Session = Depends(get_db)):
 @router.post("/what-if-simulate")
 def run_what_if_simulation(
     payload: WhatIfRequest,
+    ctx: RequestContext = Depends(get_request_context),
     db: Session = Depends(get_db),
 ):
     """
-    Signature Differentiator 3: What-If Simulator.
+    Signature Differentiator 4: What-If Simulator.
     Simulates operational shocks (e.g. 30% inspectors unavailable, 70% regional staffing)
-    and predicts how many applications would breach SLA and affected student seats.
+    and predicts how many applications would breach SLA and affected student seats using
+    the deterministic workload queueing model.
     """
-    total_apps = db.query(Application).filter(Application.status == "IN_PROGRESS").count()
-    
-    # Simulation heuristic based on staffing & inspector availability
-    slowdown_factor = (100 / max(20, payload.staffing_level_percent)) * (1.0 + (payload.inspector_shortage_percent / 100.0))
-    predicted_breaches = min(total_apps, int(total_apps * (slowdown_factor - 1.0) * 0.45))
-    at_risk_students = predicted_breaches * 120
+    dal = ScopedDAL(db, ctx)
+    active_apps = [a for a in dal.get_applications() if a.status in ["IN_PROGRESS", "ESCALATED", "DEFICIENT"]]
+    total_apps = len(active_apps)
+
+    from app.workload_forecasting import workload_engine
+    now = datetime.utcnow()
+
+    staffing_efficiency = max(0.2, payload.staffing_level_percent / 100.0)
+    inspector_shortage = payload.inspector_shortage_percent / 100.0
+
+    # 1. Baseline Calculations (100% capacity, 0% shortage)
+    baseline_breaches = 0
+    baseline_at_risk_students = 0
+    baseline_samples = []
+
+    # 2. Shocked Calculations (Requested shortage & reduced capacity)
+    shocked_breaches = 0
+    shocked_at_risk_students = 0
+    shocked_samples = []
+
+    for app in active_apps:
+        seats = 360 if app.application_type == "NEW_INSTITUTION" else 180 if app.application_type == "INCREASE_INTAKE" else 60
+
+        # Compute Baseline
+        base_f = workload_engine.compute_workload_forecast(
+            app=app,
+            db=db,
+            current_time=now,
+            staffing_efficiency_ratio=1.0,
+            inspector_shortage_ratio=0.0,
+        )
+        base_is_breach = base_f["is_breach_forecasted"] or base_f["breach_probability"] >= 0.50
+        if base_is_breach:
+            baseline_breaches += 1
+            baseline_at_risk_students += seats
+            if len(baseline_samples) < 5:
+                baseline_samples.append({
+                    "application_no": app.application_no,
+                    "institution_name": app.institution.name if app.institution else "Unknown",
+                    "current_stage": app.current_stage,
+                    "projected_completion_date": base_f["projected_completion_date"],
+                    "sla_deadline": base_f["sla_deadline"],
+                    "breach_probability": base_f["breach_probability"],
+                    "p90_date": base_f["probability_band"]["p90_conservative_date"],
+                })
+
+        # Compute After Shock
+        shock_f = workload_engine.compute_workload_forecast(
+            app=app,
+            db=db,
+            current_time=now,
+            staffing_efficiency_ratio=staffing_efficiency,
+            inspector_shortage_ratio=inspector_shortage,
+        )
+        shock_is_breach = shock_f["is_breach_forecasted"] or shock_f["breach_probability"] >= 0.50
+        if shock_is_breach:
+            shocked_breaches += 1
+            shocked_at_risk_students += seats
+            if len(shocked_samples) < 5:
+                shocked_samples.append({
+                    "application_no": app.application_no,
+                    "institution_name": app.institution.name if app.institution else "Unknown",
+                    "current_stage": app.current_stage,
+                    "projected_completion_date": shock_f["projected_completion_date"],
+                    "sla_deadline": shock_f["sla_deadline"],
+                    "breach_probability": shock_f["breach_probability"],
+                    "p90_date": shock_f["probability_band"]["p90_conservative_date"],
+                })
+
+    slowdown_factor = (1.0 / staffing_efficiency) * (1.0 + (inspector_shortage * 0.5))
 
     return {
+        "model_label": "forecast from workload model",
         "simulation_parameters": {
             "inspector_shortage": f"{payload.inspector_shortage_percent}% unavailable",
             "regional_staffing": f"{payload.staffing_level_percent}% capacity",
             "effective_slowdown": f"{round(slowdown_factor, 2)}x delay multiplier",
         },
+        "baseline": {
+            "total_active_workload": total_apps,
+            "predicted_sla_breaches": baseline_breaches,
+            "projected_overdue_rate": f"{round((baseline_breaches / max(1, total_apps)) * 100, 1)}%",
+            "at_risk_student_seats": baseline_at_risk_students,
+            "operational_status": "NORMAL CAPACITY" if baseline_breaches <= 4 else "ELEVATED",
+            "breached_samples": baseline_samples,
+        },
+        "after_shock": {
+            "total_active_workload": total_apps,
+            "predicted_sla_breaches": shocked_breaches,
+            "projected_overdue_rate": f"{round((shocked_breaches / max(1, total_apps)) * 100, 1)}%",
+            "at_risk_student_seats": shocked_at_risk_students,
+            "operational_status": "BOTTLENECK SURGE" if shocked_breaches > baseline_breaches else "STABLE",
+            "breached_samples": shocked_samples,
+        },
+        "delta": {
+            "additional_breaches": max(0, shocked_breaches - baseline_breaches),
+            "additional_students_at_risk": max(0, shocked_at_risk_students - baseline_at_risk_students),
+            "slowdown_factor": round(slowdown_factor, 2),
+            "overdue_rate_increase": f"{round(max(0, (shocked_breaches - baseline_breaches) / max(1, total_apps)) * 100, 1)}%",
+        },
         "impact_projections": {
             "total_active_workload": total_apps,
-            "predicted_sla_breaches": predicted_breaches,
-            "projected_overdue_rate": f"{round((predicted_breaches / max(1, total_apps)) * 100, 1)}%",
-            "at_risk_student_seats": at_risk_students,
+            "predicted_sla_breaches": shocked_breaches,
+            "projected_overdue_rate": f"{round((shocked_breaches / max(1, total_apps)) * 100, 1)}%",
+            "at_risk_student_seats": shocked_at_risk_students,
+            "breached_applications_sample": shocked_samples,
+            "baseline_breaches": baseline_breaches,
+            "baseline_overdue_rate": f"{round((baseline_breaches / max(1, total_apps)) * 100, 1)}%",
         },
+        "assumptions": [
+            "Projections calculated deterministically by WorkloadForecastEngine over all active corridor dockets.",
+            "Baseline assumes 100% regional staffing and 0% committee shortage.",
+            "Operational shock inflates stage handling duration inversely proportional to capacity.",
+            "Inspector shortage selectively expands EVC on-site scheduling horizons.",
+        ],
         "mitigation_recommendations": [
             "Enable virtual EVC inspections as permitted under Clause 1.9 & Clause 2.28.",
             "Cross-allocate empanelled experts from adjacent regional office panels.",
@@ -392,9 +665,13 @@ def run_what_if_simulation(
 # 4. DOCUMENT INTEGRITY & ANOMALIES
 # -----------------------------------------------------------------------------
 @router.get("/anomalies")
-def get_document_anomalies(db: Session = Depends(get_db)):
-    """Returns detected document anomalies and fraud flags (SUGGEST-ONLY for officer review)."""
-    anomalies = db.query(DocumentAnomaly).filter(DocumentAnomaly.is_dismissed == False).all()
+def get_document_anomalies(
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+):
+    """Returns detected document anomalies and fraud flags (SUGGEST-ONLY for officer review). Scoped by role with ScopedDAL."""
+    dal = ScopedDAL(db, ctx)
+    anomalies = dal.get_document_anomalies()
     results = []
 
     for a in anomalies:
@@ -404,11 +681,11 @@ def get_document_anomalies(db: Session = Depends(get_db)):
             "anomaly_type": a.anomaly_type,
             "severity": a.severity,
             "details": a.details,
-            "document_name": doc.doc_type.name,
-            "document_number": doc.document_number,
-            "institution_name": doc.institution.name,
-            "file_hash_sha256": doc.file_hash_sha256,
-            "created_at": a.created_at.strftime("%d-%b-%Y %I:%M %p"),
+            "document_name": doc.doc_type.name if doc and doc.doc_type else "Unknown Document",
+            "document_number": doc.document_number if doc else "N/A",
+            "institution_name": doc.institution.name if doc and doc.institution else "Unknown Institution",
+            "file_hash_sha256": doc.file_hash_sha256 if doc else "N/A",
+            "created_at": a.created_at.strftime("%d-%b-%Y %I:%M %p") if hasattr(a.created_at, "strftime") else str(a.created_at),
         })
 
     return {"count": len(results), "anomalies": results}
@@ -448,20 +725,21 @@ def parse_natural_language_query(
         if reg_code in q or reg_code.upper() in payload.plain_text_query:
             filters["region_code"] = reg_code.upper()
 
-    # Query with strict ORM parameters
-    query = db.query(Application)
-    if filters["is_overdue"]:
-        query = query.filter(Application.sla_status == "OVERDUE")
-    if filters["stage"]:
-        query = query.filter(Application.current_stage.like(f"%{filters['stage']}%"))
-    if filters["region_code"]:
-        query = query.join(Application.region).filter(Region.code == filters["region_code"])
+    # Query strictly scoped via ScopedDAL
+    dal = ScopedDAL(db, ctx)
+    all_scoped = dal.get_applications()
 
-    # Enforce user role scope
-    if ctx.role == "REGIONAL_OFFICER" and ctx.region_id:
-        query = query.filter(Application.region_id == ctx.region_id)
-
-    matches = query.limit(20).all()
+    matches = []
+    for a in all_scoped:
+        if filters["is_overdue"] and a.sla_status != "OVERDUE":
+            continue
+        if filters["stage"] and filters["stage"].lower() not in a.current_stage.lower():
+            continue
+        if filters["region_code"] and (not a.region or a.region.code != filters["region_code"]):
+            continue
+        matches.append(a)
+        if len(matches) >= 20:
+            break
 
     return {
         "parsed_parameters": filters,

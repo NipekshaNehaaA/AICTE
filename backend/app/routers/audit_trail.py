@@ -19,21 +19,20 @@ from app.scoped_dal import ScopedDAL, RequestContext
 
 router = APIRouter(prefix="/api/v1/audit", tags=["Audit & Non-Repudiation"])
 
-def get_request_context(
-    x_user_id: Optional[str] = Header(None),
-    x_user_role: Optional[str] = Header("AUDITOR"),
-) -> RequestContext:
-    return RequestContext(user_id=x_user_id, role=x_user_role)
+from app.auth import get_request_context
 
 @router.get("/trail")
 def get_audit_trail(
     limit: int = 50,
+    ctx: RequestContext = Depends(get_request_context),
     db: Session = Depends(get_db),
 ):
     """
     Returns audit trail entries with cryptographic hashes and actor stamps.
+    Requires authenticated session; scoped by user role with ScopedDAL.
     """
-    entries = db.query(AuditTrail).order_by(AuditTrail.id.desc()).limit(limit).all()
+    dal = ScopedDAL(db, ctx)
+    entries = dal.get_audit_trail(limit=limit)
     return {
         "count": len(entries),
         "entries": [
@@ -49,7 +48,7 @@ def get_audit_trail(
                 "entity_id": e.entity_id,
                 "metadata": e.metadata_json,
                 "ip_address": e.ip_address,
-                "timestamp": e.timestamp.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "timestamp": e.timestamp.strftime("%Y-%m-%d %H:%M:%S UTC") if hasattr(e.timestamp, "strftime") else str(e.timestamp),
             }
             for e in entries
         ],
@@ -132,3 +131,72 @@ def restore_audit_chain(db: Session = Depends(get_db)):
         entries[i].prev_entry_hash = entries[i - 1].curr_entry_hash
     db.commit()
     return {"status": "CHAIN_RESTORED"}
+
+# -----------------------------------------------------------------------------
+# OUTSIDER-VERIFIABLE MERKLE ROOTS & PUBLIC VERIFIER
+# -----------------------------------------------------------------------------
+@router.get("/merkle-roots")
+def list_daily_merkle_roots(db: Session = Depends(get_db)):
+    """
+    Returns historical sealed daily Merkle roots over immutable audit ledger entries.
+    """
+    from app.models import DailyMerkleRoot
+    from app.merkle_audit import seal_daily_merkle_root
+
+    roots = db.query(DailyMerkleRoot).order_by(DailyMerkleRoot.root_date.desc()).all()
+    if not roots:
+        # Automatically seal today's root if empty
+        r = seal_daily_merkle_root(db)
+        roots = [r]
+
+    return {
+        "count": len(roots),
+        "roots": [
+            {
+                "id": r.id,
+                "root_date": r.root_date.isoformat(),
+                "merkle_root_hash": r.merkle_root_hash,
+                "chain_head_hash": r.chain_head_hash,
+                "total_entries": r.total_entries,
+                "first_entry_id": r.first_entry_id,
+                "last_entry_id": r.last_entry_id,
+                "sealed_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            }
+            for r in roots
+        ],
+    }
+
+@router.post("/merkle-roots/seal")
+def seal_merkle_root_now(
+    target_date: Optional[str] = None, # YYYY-MM-DD
+    db: Session = Depends(get_db),
+):
+    """
+    Manually triggers computation and cryptographic sealing of the daily Merkle root.
+    """
+    from app.merkle_audit import seal_daily_merkle_root
+    from datetime import datetime
+    d = datetime.strptime(target_date, "%Y-%m-%d").date() if target_date else None
+    root = seal_daily_merkle_root(db, target_date=d)
+    return {
+        "status": "ROOT_SEALED",
+        "root_date": root.root_date.isoformat(),
+        "merkle_root_hash": root.merkle_root_hash,
+        "chain_head_hash": root.chain_head_hash,
+        "total_entries": root.total_entries,
+    }
+
+@router.get("/public-verify")
+def public_verify_report_or_hash(
+    hash: str,
+    chain_head: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Publicly accessible cryptographic verifier endpoint.
+    Verifies that a report SHA-256 hash or audit ledger transaction is authentic
+    against the immutable hash chain and daily Merkle roots.
+    CRITICAL: Exposes ZERO sensitive applicant data.
+    """
+    from app.merkle_audit import verify_public_hash
+    return verify_public_hash(db, query_hash=hash, chain_head=chain_head)

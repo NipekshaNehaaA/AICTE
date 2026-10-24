@@ -10,16 +10,22 @@ import { APHCompilerView } from '@/components/differentiators/APHCompilerView';
 import { WhatIfSimulatorView } from '@/components/differentiators/WhatIfSimulatorView';
 import { SecurityAnomaliesView } from '@/components/differentiators/SecurityAnomaliesView';
 import { AuditLedgerView } from '@/components/audit/AuditLedgerView';
+import { NotificationCenterView } from '@/components/notifications/NotificationCenterView';
 import { StakeholderTrackingView } from '@/components/dashboard/StakeholderTrackingView';
 import { OpeningExecutiveDashboard } from '@/components/dashboard/OpeningExecutiveDashboard';
+import { CasePageView } from '@/components/case/CasePageView';
+import { PublicTrackingView } from '@/components/tracking/PublicTrackingView';
 
 export default function HomePage() {
   const { activeNavTab } = useApp();
 
   // Dynamic Navigation Views
+  if (activeNavTab === 'case') return <CasePageView />;
+  if (activeNavTab === 'public-tracking') return <PublicTrackingView />;
   if (activeNavTab === 'applications') return <ApplicationsView />;
   if (activeNavTab === 'evc') return <EVCView />;
   if (activeNavTab === 'compliance') return <ComplianceView />;
+  if (activeNavTab === 'notifications') return <NotificationCenterView />;
   if (activeNavTab === 'next-best-action') return <NextBestActionQueueView />;
   if (activeNavTab === 'aph-compiler') return <APHCompilerView />;
   if (activeNavTab === 'what-if') return <WhatIfSimulatorView />;

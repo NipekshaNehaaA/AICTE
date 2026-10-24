@@ -64,7 +64,7 @@ def run_system_verification():
     # 3. Pre-Seeded Hackathon Edge Cases
     print("\n--- 3. PRE-SEEDED JURY SCENARIOS & EDGE CASES ---")
     
-    # Edge Case A: Paused Clock in Deficiency Cure (Clause 1.8(f))
+    # Edge Case A: Paused Clock in Deficiency Cure (design choice, configurable)
     cursor.execute("SELECT application_no, current_stage, status, sla_status FROM applications WHERE status = 'DEFICIENT'")
     deficiencies = cursor.fetchall()
     print(f"  • Paused Clock (Deficiency Cure) Cases: {len(deficiencies)} found")

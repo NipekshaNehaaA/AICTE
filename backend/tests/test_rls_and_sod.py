@@ -2,20 +2,28 @@
 =============================================================================
 TEST SUITE: RBAC, RLS SCOPING, SEPARATION OF DUTIES (SoD), AND AUTH LOCKOUT
 =============================================================================
+ENVIRONMENT NOTICE:
+Native PostgreSQL & Docker are not available on this local development environment.
+Row-Level Security (RLS) is strictly enforced at the application tier by ScopedDAL
+in development mode, validated by these negative security tests. In production,
+PostgreSQL engine-level RLS is enforced via schema_rls_postgres.sql.
+
 Demonstrates and validates:
 1. Cross-region read blocked (Regional Officer cannot see other regions)
 2. Cross-institution access blocked (Institution User cannot see other institutions)
-3. Empty / missing context returns zero rows (Default Deny)
-4. Committee member sees ONLY assigned EVC cases
-5. Auditor role is strictly read-only (Mutations blocked)
-6. Pairwise SoD violations blocked:
+3. Cross-institution write blocked (Institution User cannot mutate other institutions' apps)
+4. Empty / missing context returns zero rows (Default Deny)
+5. Committee member sees ONLY assigned EVC cases
+6. Auditor role is strictly read-only (Mutations blocked)
+7. Forged HTTP headers rejected (x-user-role / x-user-id rejected without verified JWT)
+8. Pairwise SoD violations blocked:
    - Submitter != Verifier
    - Verifier != Approver
    - Submitter != Approver
    - AI Draft Requester != AI Draft Approver
-7. Every SoD violation is recorded in the audit log
-8. Brute-force lockout triggers after 5 failed attempts
-9. Cryptographic SHA-256 audit hash-chain continuity
+9. Every SoD violation is recorded in the audit log
+10. Brute-force lockout triggers after 5 failed attempts
+11. Cryptographic SHA-256 audit hash-chain continuity
 =============================================================================
 """
 
@@ -24,6 +32,7 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import pytest
+from fastapi import HTTPException
 from app.database import SessionLocal
 from app.models import (
     User,
@@ -48,7 +57,11 @@ from app.auth import (
     record_login_failure,
     check_account_lockout,
     record_login_success,
+    get_request_context,
 )
+from tests.http_client import AppTestClient
+
+http_client = AppTestClient()
 
 @pytest.fixture
 def db():
@@ -99,6 +112,81 @@ def test_brute_force_lockout():
     record_login_success(test_email)
     assert check_account_lockout(test_email) is None
 
+def test_http_forged_headers_rejected(db):
+    """
+    HTTP Security Test (APH & DPDP Compliance):
+    Runs through real HTTP endpoints (TestClient + JWT).
+    Derives role and identity ONLY from verified JWT.
+    Direct header forgery (x-user-role, x-user-id) is rejected with 401/403.
+    """
+    # 1. Missing Authorization header with forged role header -> 401 Unauthorized
+    r1 = http_client.get("/api/v1/applications", headers={"x-user-role": "SUPER_ADMIN"})
+    assert r1.status_code == 401
+    assert "Direct user role or identity headers are rejected" in r1.json().get("detail", "")
+
+    # 2. Missing Authorization header with forged user_id header -> 401 Unauthorized
+    r2 = http_client.get("/api/v1/applications", headers={"x-user-id": "usr-admin-root"})
+    assert r2.status_code == 401
+
+    # 3. Valid token for REGIONAL_OFFICER, but forged x-user-role='SUPER_ADMIN' -> 403 Forbidden
+    swro = db.query(Region).filter(Region.code == "SWRO").first()
+    token = create_access_token({"sub": "usr-ro-01", "role": "REGIONAL_OFFICER", "region_id": swro.id if swro else None})
+    r3 = http_client.get(
+        "/api/v1/applications",
+        headers={"Authorization": f"Bearer {token}", "x-user-role": "SUPER_ADMIN"},
+    )
+    assert r3.status_code == 403
+    assert "Forged x-user-role" in r3.json().get("detail", "")
+
+    # 4. Valid token for usr-ro-01, but forged x-user-id='usr-hacked-root' -> 403 Forbidden
+    r4 = http_client.get(
+        "/api/v1/applications",
+        headers={"Authorization": f"Bearer {token}", "x-user-id": "usr-hacked-root"},
+    )
+    assert r4.status_code == 403
+    assert "Forged x-user-id" in r4.json().get("detail", "")
+
+    # 5. Legitimate token with omitted headers succeeds and derives identity solely from JWT
+    r5 = http_client.get("/api/v1/applications", headers={"Authorization": f"Bearer {token}"})
+    assert r5.status_code == 200
+
+def test_http_default_deny():
+    """
+    HTTP Security Test (Default Deny):
+    Unauthenticated requests to protected endpoints return 401 Unauthorized.
+    """
+    r1 = http_client.get("/api/v1/applications")
+    assert r1.status_code == 401
+    assert "Authentication required" in r1.json().get("detail", "")
+
+    r2 = http_client.get("/api/v1/compliance/documents")
+    assert r2.status_code == 401
+
+    r3 = http_client.get("/api/v1/audit/trail")
+    assert r3.status_code == 401
+
+    r4 = http_client.get("/api/v1/differentiators/anomalies")
+    assert r4.status_code == 401
+
+def test_audit_trail_and_anomalies_require_auth(db):
+    """
+    Asserts unauthenticated calls to /api/v1/audit/trail and /api/v1/differentiators/anomalies
+    return 401, while authenticated requests succeed with role-based scoping.
+    """
+    # Unauthenticated
+    assert http_client.get("/api/v1/audit/trail").status_code == 401
+    assert http_client.get("/api/v1/differentiators/anomalies").status_code == 401
+
+    # Authenticated with Auditor role
+    auditor_token = create_access_token({"sub": "usr-auditor-01", "role": "AUDITOR"})
+    res_trail = http_client.get("/api/v1/audit/trail", headers={"Authorization": f"Bearer {auditor_token}"})
+    assert res_trail.status_code == 200
+    assert "entries" in res_trail.json()
+
+    res_anom = http_client.get("/api/v1/differentiators/anomalies", headers={"Authorization": f"Bearer {auditor_token}"})
+    assert res_anom.status_code == 200
+    assert "anomalies" in res_anom.json()
+
 # -----------------------------------------------------------------------------
 # 2. RBAC & RLS SCOPING TESTS (POSITIVE & NEGATIVE)
 # -----------------------------------------------------------------------------
@@ -146,6 +234,40 @@ def test_cross_institution_access_blocked(db):
     for app in apps:
         assert app.institution_id == inst_1.id
         assert app.institution_id != inst_2.id
+
+def test_cross_institution_write_blocked(db):
+    """Negative Test: Institution User cannot mutate or advance applications belonging to another institution."""
+    inst_1 = db.query(Institution).first()
+    inst_2 = db.query(Institution).filter(Institution.id != inst_1.id).first()
+    assert inst_1 and inst_2
+
+    # Find or create application belonging exclusively to inst_2
+    app_2 = db.query(Application).filter(Application.institution_id == inst_2.id).first()
+    if not app_2:
+        app_2 = Application(
+            application_no="AICTE/TEST-WRITE-ISO/001",
+            institution_id=inst_2.id,
+            region_id=inst_2.region_id,
+            application_type="NEW_INSTITUTION",
+            academic_year="2026-2027",
+            current_stage="SUBMITTED",
+            submitter_id="inst-2-user-diff",
+        )
+        db.add(app_2)
+        db.commit()
+
+    # Context acting for Institution 1
+    ctx_inst1 = RequestContext(
+        user_id="usr-inst-1",
+        role="INSTITUTION_USER",
+        institution_id=inst_1.id,
+    )
+    dal = ScopedDAL(db, ctx_inst1)
+
+    # Attempting to mutate application of Institution 2 must fail with SecurityScopeError
+    with pytest.raises(SecurityScopeError) as exc_info:
+        dal.advance_application_stage(app_2.id, "PASSED_SCRUTINY", "Unauthorized cross-tenant mutation")
+    assert "outside user scope" in str(exc_info.value) or "not found" in str(exc_info.value)
 
 def test_committee_member_scoping(db):
     """Negative Test: Committee Member only sees cases where they are explicitly assigned."""
@@ -270,6 +392,101 @@ def test_audit_hash_chain_continuity(db):
             f"Audit Hash Chain Broken at entry #{curr.id}! "
             f"Expected prev_hash {prev.curr_entry_hash}, found {curr.prev_entry_hash}"
         )
+
+# -----------------------------------------------------------------------------
+# 5. REAL HTTP ENDPOINT CROSS-SCOPE TESTS (TESTCLIENT + JWT)
+# -----------------------------------------------------------------------------
+def test_http_cross_region_read_blocked(db):
+    """HTTP Security Test: Regional Officer of SWRO cannot access NRO applications via HTTP."""
+    swro = db.query(Region).filter(Region.code == "SWRO").first()
+    nro = db.query(Region).filter(Region.code == "NRO").first()
+    assert swro and nro
+
+    token_swro = create_access_token({"sub": "usr-ro-swro", "role": "REGIONAL_OFFICER", "region_id": swro.id})
+    resp = http_client.get("/api/v1/applications", headers={"Authorization": f"Bearer {token_swro}"})
+    assert resp.status_code == 200
+    apps = resp.json().get("applications", [])
+    assert len(apps) > 0
+
+    for a in apps:
+        assert a["region_id"] == swro.id, f"Cross-region leak: App {a['id']} belongs to region {a['region_id']}, not SWRO"
+        assert a["region_id"] != nro.id, "Security Breach: NRO application returned to SWRO officer via HTTP!"
+
+def test_http_cross_institution_read_blocked(db):
+    """HTTP Security Test: Institution 1 user cannot read Institution 2 applications via HTTP."""
+    inst_1 = db.query(Institution).first()
+    inst_2 = db.query(Institution).filter(Institution.id != inst_1.id).first()
+    assert inst_1 and inst_2
+
+    token_inst1 = create_access_token({"sub": "usr-inst-1", "role": "INSTITUTION_USER", "institution_id": inst_1.id})
+    resp = http_client.get("/api/v1/applications", headers={"Authorization": f"Bearer {token_inst1}"})
+    assert resp.status_code == 200
+    apps = resp.json().get("applications", [])
+    assert len(apps) > 0
+
+    for a in apps:
+        assert a["institution_id"] == inst_1.id
+        assert a["institution_id"] != inst_2.id
+
+def test_http_cross_institution_write_blocked(db):
+    """HTTP Security Test: Institution 1 user cannot mutate Institution 2 application via HTTP."""
+    inst_1 = db.query(Institution).first()
+    inst_2 = db.query(Institution).filter(Institution.id != inst_1.id).first()
+    assert inst_1 and inst_2
+
+    app_2 = db.query(Application).filter(Application.institution_id == inst_2.id).first()
+    assert app_2
+
+    token_inst1 = create_access_token({"sub": "usr-inst-1", "role": "INSTITUTION_USER", "institution_id": inst_1.id})
+    resp = http_client.post(
+        f"/api/v1/workflow/{app_2.id}/revert",
+        headers={"Authorization": f"Bearer {token_inst1}"},
+        json={"reason_category": "DEFICIENT", "deficiency_remarks": "Unauthorized mutation", "cure_days": 15}
+    )
+    # ScopedDAL enforces that app_2 is outside user scope -> returns 403 or 404
+    assert resp.status_code in (403, 404)
+
+# -----------------------------------------------------------------------------
+# 6. ARCHITECTURAL STATIC ANALYSIS: ZERO UNCONSTRAINED ROUTER QUERIES
+# -----------------------------------------------------------------------------
+def test_no_router_queries_db_outside_scoped_dal():
+    """
+    Architectural Static Analysis Test:
+    Parses the AST of all routers in backend/app/routers (except auth_routes which manages users)
+    and verifies that no router queries Application or InstitutionalDocument directly
+    via unconstrained db.query() / session.query(). All access must go through ScopedDAL.
+    """
+    import ast
+    import glob
+
+    routers_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "app", "routers"))
+    router_files = glob.glob(os.path.join(routers_dir, "*.py"))
+
+    violations = []
+    forbidden_models = {"Application", "InstitutionalDocument"}
+
+    for fpath in router_files:
+        fname = os.path.basename(fpath)
+        if fname in ("auth_routes.py", "__init__.py"):
+            continue
+
+        with open(fpath, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename=fpath)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                is_query = False
+                if isinstance(func, ast.Attribute) and func.attr == "query":
+                    if isinstance(func.value, ast.Name) and func.value.id in ("db", "session"):
+                        is_query = True
+
+                if is_query:
+                    for arg in node.args:
+                        if isinstance(arg, ast.Name) and arg.id in forbidden_models:
+                            violations.append(f"{fname}:{node.lineno} calls db.query({arg.id}) directly outside ScopedDAL!")
+
+    assert len(violations) == 0, f"Found {len(violations)} router query violations outside ScopedDAL:\n" + "\n".join(violations)
 
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
