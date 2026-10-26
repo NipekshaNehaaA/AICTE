@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { useApp, DEMO_USERS, UserRole } from '@/lib/app-context';
+import { useApp, DEMO_USERS, UserRole, UserProfile } from '@/lib/app-context';
 import { apiFetch } from '@/lib/api';
 import {
   ShieldCheck,
@@ -25,26 +25,54 @@ import {
   ToggleLeft,
   ToggleRight,
   Phone,
+  QrCode,
+  Copy,
+  Check,
+  Key,
 } from 'lucide-react';
 
 export const LoginPage: React.FC = () => {
-  const { loginAsPersona, loginWithToken, restartBootSequence, isDemoMode, evaluatorMode, toggleEvaluatorMode } = useApp();
-  const isEvalActive = evaluatorMode || isDemoMode;
+  const {
+    loginAsPersona,
+    loginWithToken,
+    restartBootSequence,
+    workspace,
+    setWorkspace,
+    sandboxOverride,
+    updateSandboxOverride,
+  } = useApp();
+  const isEvalActive = workspace === 'sandbox';
 
   const [activeTab, setActiveTab] = useState<'credentials' | 'signup' | 'verify' | 'forgot' | 'personas'>('credentials');
   
+  // Override recipient modal state (for Sandbox workspace)
+  const [showOverrideModal, setShowOverrideModal] = useState(false);
+  const [overrideEmailInput, setOverrideEmailInput] = useState('');
+  const [overrideWhatsappInput, setOverrideWhatsappInput] = useState('');
+  const [savingOverride, setSavingOverride] = useState(false);
+
   // Login form state
-  const [email, setEmail] = useState('ro.swro@aicte-india.org');
-  const [password, setPassword] = useState('DemoPassword@123');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
 
-  // MFA State
-  const [mfaStep, setMfaStep] = useState(false);
+  // MFA & TOTP Enrollment State
+  const [authSubStep, setAuthSubStep] = useState<'credentials' | 'mfa_verify' | 'mfa_enroll' | 'recovery_codes'>('credentials');
   const [mfaCode, setMfaCode] = useState('');
   const [mfaUserData, setMfaUserData] = useState<any | null>(null);
+  const [enrollmentData, setEnrollmentData] = useState<{
+    qr_code_base64?: string;
+    manual_entry_key?: string;
+    provisioning_uri?: string;
+  } | null>(null);
+  const [enrollMfaCode, setEnrollMfaCode] = useState('');
+  const [recoveryCodes, setRecoveryCodes] = useState<string[]>([]);
+  const [savedAuthTokens, setSavedAuthTokens] = useState<any | null>(null);
+  const [isRecoveryMode, setIsRecoveryMode] = useState(false);
+  const [copiedCodes, setCopiedCodes] = useState(false);
 
   // Institution Sign-up State
   const [signupForm, setSignupForm] = useState({
@@ -188,6 +216,29 @@ export const LoginPage: React.FC = () => {
     loginAsPersona(role);
   };
 
+  const buildUserProfile = (data: any, role: UserRole, userEmail: string): UserProfile => {
+    const base = DEMO_USERS[role] || {
+      id: data.user_id || 'usr-login',
+      name: data.full_name || userEmail,
+      email: userEmail,
+      role,
+      roleLabel: data.role || 'Officer',
+      regionCode: data.region_code || 'SWRO',
+    };
+    return {
+      ...base,
+      id: data.user_id || base.id,
+      name: data.full_name || base.name,
+      email: data.email || userEmail,
+      role,
+      roleLabel: data.role || base.roleLabel,
+      regionCode: data.region_code || base.regionCode,
+      institutionName: role === 'INSTITUTION_USER' ? (data.institution_name || base.institutionName) : undefined,
+      institutionPid: role === 'INSTITUTION_USER' ? (data.institution_pid || base.institutionPid) : undefined,
+      institutionId: role === 'INSTITUTION_USER' ? (data.institution_id || base.institutionId) : undefined,
+    };
+  };
+
   const handleCredentialsSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage('');
@@ -201,20 +252,24 @@ export const LoginPage: React.FC = () => {
         body: JSON.stringify({ email, password }),
       });
 
-      if (data.mfa_required) {
+      if (data.mfa_enrollment_required) {
         setMfaUserData(data);
-        setMfaStep(true);
+        setEnrollmentData({
+          qr_code_base64: data.qr_code_base64,
+          manual_entry_key: data.manual_entry_key,
+          provisioning_uri: data.provisioning_uri,
+        });
+        setEnrollMfaCode('');
+        setAuthSubStep('mfa_enroll');
+      } else if (data.mfa_required) {
+        setMfaUserData(data);
+        setMfaCode('');
+        setIsRecoveryMode(false);
+        setAuthSubStep('mfa_verify');
       } else {
         const role = (data.role || 'REGIONAL_OFFICER') as UserRole;
         if (data.access_token) {
-          const matchedUser = DEMO_USERS[role] || {
-            id: data.user_id || 'usr-login',
-            name: data.full_name || email,
-            email,
-            role,
-            roleLabel: data.role || 'Officer',
-            regionCode: data.region_code || 'SWRO',
-          };
+          const matchedUser = buildUserProfile(data, role, email);
           loginWithToken(matchedUser, data.access_token);
         } else {
           loginAsPersona(role);
@@ -227,37 +282,70 @@ export const LoginPage: React.FC = () => {
     }
   };
 
+  const handleMfaEnrollConfirm = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMessage('');
+    setLoading(true);
+
+    try {
+      const cleanCode = enrollMfaCode.replace(/\D/g, '').trim();
+      const data = await apiFetch<any>('/api/v1/auth/mfa-enroll-confirm', {
+        method: 'POST',
+        skipAuth: true,
+        body: JSON.stringify({
+          email: mfaUserData?.email || email,
+          mfa_code: cleanCode,
+        }),
+      });
+
+      setSavedAuthTokens(data);
+      if (data.recovery_codes && data.recovery_codes.length > 0) {
+        setRecoveryCodes(data.recovery_codes);
+        setAuthSubStep('recovery_codes');
+      } else {
+        const role = (data.role || mfaUserData?.role || 'REGIONAL_OFFICER') as UserRole;
+        const matchedUser = buildUserProfile(data, role, mfaUserData?.email || email);
+        loginWithToken(matchedUser, data.access_token);
+      }
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Verification failed. Please check the 6-digit code in your authenticator app.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleProceedAfterRecoveryCodes = () => {
+    if (!savedAuthTokens) return;
+    const role = (savedAuthTokens.role || mfaUserData?.role || 'REGIONAL_OFFICER') as UserRole;
+    const matchedUser = buildUserProfile(savedAuthTokens, role, mfaUserData?.email || email);
+    loginWithToken(matchedUser, savedAuthTokens.access_token);
+  };
+
   const handleMfaVerify = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage('');
     setLoading(true);
 
     try {
+      const payloadCode = isRecoveryMode ? mfaCode.trim() : mfaCode.replace(/\D/g, '').trim();
       const data = await apiFetch<any>('/api/v1/auth/mfa-verify', {
         method: 'POST',
         skipAuth: true,
         body: JSON.stringify({
           email: mfaUserData?.email || email,
-          mfa_code: mfaCode.replace(/\D/g, '').trim(),
+          mfa_code: payloadCode,
         }),
       });
 
       const role = (data.role || mfaUserData?.role || 'REGIONAL_OFFICER') as UserRole;
       if (data.access_token) {
-        const matchedUser = DEMO_USERS[role] || {
-          id: data.user_id || mfaUserData?.user_id || 'usr-mfa',
-          name: data.full_name || mfaUserData?.full_name || email,
-          email,
-          role,
-          roleLabel: data.role || 'Officer',
-          regionCode: data.region_code || 'SWRO',
-        };
+        const matchedUser = buildUserProfile(data, role, mfaUserData?.email || email);
         loginWithToken(matchedUser, data.access_token);
       } else {
         loginAsPersona(role);
       }
     } catch (err: any) {
-      setErrorMessage(err.message || 'Invalid TOTP code. Please try again.');
+      setErrorMessage(err.message || 'Invalid two-factor authentication code. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -288,9 +376,7 @@ export const LoginPage: React.FC = () => {
         }),
       });
 
-      setSuccessMessage('Registration successful! Verification email has been dispatched.');
-      setSignupIssuedToken(resp.verification_token || '');
-      setVerifyToken(resp.verification_token || '');
+      setSuccessMessage('Registration submitted! If eligible, verification instructions have been dispatched to your email.');
     } catch (err: any) {
       setErrorMessage(err.message || 'Sign-up failed. Please check inputs.');
     } finally {
@@ -335,9 +421,6 @@ export const LoginPage: React.FC = () => {
         body: JSON.stringify({ email: forgotEmail.trim() }),
       });
       setSuccessMessage(resp.message || 'Password reset instructions dispatched.');
-      if (resp.reset_token) {
-        setResetToken(resp.reset_token);
-      }
       setForgotStep(2);
     } catch (err: any) {
       setErrorMessage(err.message || 'Could not process password reset.');
@@ -387,12 +470,6 @@ export const LoginPage: React.FC = () => {
               Evaluation Sandbox Active • 1-Click Personas & Time Travel Enabled • Synthetic Evaluation Data
             </span>
           </div>
-          <button
-            onClick={() => toggleEvaluatorMode(false)}
-            className="px-2.5 py-1 bg-black text-amber-300 rounded text-[10px] font-bold hover:bg-slate-900 transition-all"
-          >
-            Disable Evaluator Mode
-          </button>
         </div>
       )}
 
@@ -416,19 +493,38 @@ export const LoginPage: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-3">
-          {/* Admin Evaluator Mode Toggle */}
-          <button
-            onClick={() => toggleEvaluatorMode(!isEvalActive)}
-            className={`text-xs font-bold px-3 py-1.5 rounded-lg border flex items-center gap-1.5 transition-all shadow-xs ${
-              isEvalActive
-                ? 'bg-amber-100 text-amber-900 border-amber-300 hover:bg-amber-200'
-                : 'bg-white text-ink-muted hover:text-ink-strong border-ink-line'
-            }`}
-            title="Toggle Evaluator Mode (Enables 1-Click Personas, Demo Shortcuts & Time-Travel)"
-          >
-            {isEvalActive ? <ToggleRight className="w-4 h-4 text-amber-600" /> : <ToggleLeft className="w-4 h-4 text-slate-400" />}
-            <span>Evaluator Mode: {isEvalActive ? 'ON' : 'OFF'}</span>
-          </button>
+          {/* Prominent Live | Sandbox Workspace Switcher */}
+          <div className="flex items-center bg-slate-100 p-1 rounded-xl border border-ink-line shadow-xs">
+            <button
+              type="button"
+              data-testid="switch-workspace-live"
+              onClick={() => {
+                setWorkspace('live');
+                if (activeTab === 'personas') setActiveTab('credentials');
+              }}
+              className={`px-3 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
+                workspace === 'live'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'text-ink-muted hover:text-ink'
+              }`}
+            >
+              <span className={`w-2 h-2 rounded-full ${workspace === 'live' ? 'bg-white' : 'bg-emerald-500'}`} />
+              Live
+            </button>
+            <button
+              type="button"
+              data-testid="switch-workspace-sandbox"
+              onClick={() => setWorkspace('sandbox')}
+              className={`px-3 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
+                workspace === 'sandbox'
+                  ? 'bg-amber-500 text-slate-950 shadow-xs'
+                  : 'text-ink-muted hover:text-ink'
+              }`}
+            >
+              <span className={`w-2 h-2 rounded-full ${workspace === 'sandbox' ? 'bg-black' : 'bg-amber-500'}`} />
+              Sandbox
+            </button>
+          </div>
 
           <button
             onClick={restartBootSequence}
@@ -444,6 +540,62 @@ export const LoginPage: React.FC = () => {
       {/* Main Authentication Card */}
       <div className="max-w-4xl mx-auto w-full my-6">
         <div className="bg-white rounded-2xl border border-ink-line shadow-card overflow-hidden">
+          {/* Dynamic Coloured Workspace Banner */}
+          {workspace === 'sandbox' ? (
+            <div
+              id="sandbox-workspace-banner"
+              data-testid="banner-sandbox-workspace"
+              className="bg-amber-500 text-slate-950 px-6 py-2 text-xs font-bold flex flex-wrap items-center justify-between gap-2 border-b border-amber-600 shrink-0"
+            >
+              <div className="flex items-center gap-2">
+                <span className="px-2 py-0.5 bg-black text-amber-300 rounded text-[10px] font-black uppercase tracking-wider">
+                  SANDBOX WORKSPACE (aicte_sandbox.db)
+                </span>
+                <span>
+                  Synthetic Data • One-Click Personas • Bypass PIN 123456 • Simulated Lifecycle
+                </span>
+              </div>
+              <div className="flex items-center gap-3">
+                <span className="text-[11px] font-mono font-medium">
+                  Messages: {sandboxOverride?.override_email || sandboxOverride?.override_whatsapp ? (
+                    <span className="underline font-bold">Sandbox: sent to {sandboxOverride.override_email || sandboxOverride.override_whatsapp}</span>
+                  ) : (
+                    <span className="opacity-80">Skipping synthetic addresses</span>
+                  )}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOverrideEmailInput(sandboxOverride?.override_email || '');
+                    setOverrideWhatsappInput(sandboxOverride?.override_whatsapp || '');
+                    setShowOverrideModal(true);
+                  }}
+                  className="px-2 py-0.5 bg-slate-900 hover:bg-black text-amber-300 rounded text-[10px] font-bold transition-all shadow-xs"
+                >
+                  Configure Recipient
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div
+              id="live-workspace-banner"
+              data-testid="banner-live-workspace"
+              className="bg-emerald-700 text-white px-6 py-2 text-xs font-bold flex flex-wrap items-center justify-between gap-2 border-b border-emerald-800 shrink-0"
+            >
+              <div className="flex items-center gap-2">
+                <span className="px-2 py-0.5 bg-white text-emerald-800 rounded text-[10px] font-black uppercase tracking-wider">
+                  LIVE PRODUCTION WORKSPACE (aicte_live.db)
+                </span>
+                <span>
+                  Strict Regulatory Integrity • Hardware/App TOTP Required • 0 Demo Accounts
+                </span>
+              </div>
+              <span className="text-[11px] opacity-90 font-mono">
+                X-Workspace: live
+              </span>
+            </div>
+          )}
+
           {/* Card Top Banner with Dynamic Tabs */}
           <div className="bg-gradient-to-r from-blossom-100/60 via-white to-mint-100/40 p-6 border-b border-ink-line flex flex-wrap items-center justify-between gap-4">
             <div>
@@ -464,7 +616,7 @@ export const LoginPage: React.FC = () => {
                 type="button"
                 onClick={() => {
                   setActiveTab('credentials');
-                  setMfaStep(false);
+                  setAuthSubStep('credentials');
                   setErrorMessage('');
                   setSuccessMessage('');
                 }}
@@ -512,7 +664,7 @@ export const LoginPage: React.FC = () => {
                   data-testid="tab-personas"
                   onClick={() => {
                     setActiveTab('personas');
-                    setMfaStep(false);
+                    setAuthSubStep('credentials');
                     setErrorMessage('');
                     setSuccessMessage('');
                   }}
@@ -531,7 +683,7 @@ export const LoginPage: React.FC = () => {
           {/* TAB 1: SIGN IN (CREDENTIALS & TOTP MFA) */}
           {activeTab === 'credentials' && (
             <div className="p-6 sm:p-8 max-w-md mx-auto">
-              {!mfaStep ? (
+              {authSubStep === 'credentials' && (
                 <form onSubmit={handleCredentialsSubmit} className="space-y-4">
                   <div className="text-center space-y-1 pb-2">
                     <div className="w-10 h-10 rounded-full bg-blossom-100 text-blossom-600 flex items-center justify-center mx-auto mb-2">
@@ -657,39 +809,179 @@ export const LoginPage: React.FC = () => {
                     {loading ? 'Verifying Credentials...' : 'Sign In with Password →'}
                   </button>
                 </form>
-              ) : (
-                /* Step 2: Interactive TOTP MFA Verification */
+              )}
+
+              {/* Step 2A: TOTP MFA Enrollment (First-Time Setup for Officers) */}
+              {authSubStep === 'mfa_enroll' && (
+                <form onSubmit={handleMfaEnrollConfirm} className="space-y-4 animate-scale-up">
+                  <div className="text-center space-y-1 pb-1">
+                    <div className="w-10 h-10 rounded-full bg-blossom-100 text-blossom-600 flex items-center justify-center mx-auto mb-2">
+                      <QrCode className="w-5 h-5" />
+                    </div>
+                    <h3 className="text-sm font-bold text-ink-strong">
+                      Two-Factor Authentication Setup (TOTP)
+                    </h3>
+                    <p className="text-xs text-ink-muted">
+                      Your role requires hardware or app-based 2FA. Scan the QR code with your authenticator app (Google Authenticator, Microsoft Authenticator, 1Password).
+                    </p>
+                  </div>
+
+                  {errorMessage && (
+                    <div className="p-3 bg-roseState-100 border border-roseState-700/30 rounded-xl text-xs text-roseState-700 flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                      <span>{errorMessage}</span>
+                    </div>
+                  )}
+
+                  {/* QR Code Display */}
+                  {enrollmentData?.qr_code_base64 && (
+                    <div className="flex flex-col items-center justify-center p-3 bg-slate-50 border border-ink-line rounded-xl">
+                      <img
+                        src={enrollmentData.qr_code_base64}
+                        alt="TOTP Provisioning QR Code"
+                        className="w-40 h-40 rounded-lg shadow-xs bg-white p-2 border border-slate-200"
+                      />
+                      <span className="text-[10px] text-ink-muted mt-2">
+                        Scan with your authenticator mobile application
+                      </span>
+                    </div>
+                  )}
+
+                  {/* Manual Key Fallback */}
+                  {enrollmentData?.manual_entry_key && (
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between text-[11px] text-ink-muted font-semibold">
+                        <span>Cannot scan? Enter manual key:</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (enrollmentData.manual_entry_key) {
+                              navigator.clipboard.writeText(enrollmentData.manual_entry_key);
+                              setCopiedCodes(true);
+                              setTimeout(() => setCopiedCodes(false), 2000);
+                            }
+                          }}
+                          className="text-blossom-600 hover:text-blossom-700 flex items-center gap-1 font-bold"
+                        >
+                          {copiedCodes ? <Check className="w-3 h-3 text-mint-700" /> : <Copy className="w-3 h-3" />}
+                          <span>{copiedCodes ? 'Copied' : 'Copy Key'}</span>
+                        </button>
+                      </div>
+                      <div className="font-mono text-xs bg-slate-100 p-2 rounded-lg border border-ink-line text-ink-strong select-all text-center tracking-widest break-all">
+                        {enrollmentData.manual_entry_key}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 6-Digit Code Confirmation */}
+                  <div className="space-y-1.5 pt-1">
+                    <label className="text-xs font-semibold text-ink-strong block text-center">
+                      Enter 6-Digit Confirmation Code
+                    </label>
+                    <input
+                      type="text"
+                      maxLength={6}
+                      value={enrollMfaCode}
+                      onChange={(e) => setEnrollMfaCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                      required
+                      autoFocus
+                      placeholder="000000"
+                      className="w-full text-center font-mono text-xl tracking-[0.5em] py-2.5 border border-ink-line rounded-xl focus:outline-none focus:border-blossom-600 focus:ring-1 focus:ring-blossom-600 bg-[#FAFAFA]"
+                    />
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={loading || enrollMfaCode.replace(/\D/g, '').length < 6}
+                    className="btn-primary w-full justify-center !py-2.5 shadow-soft"
+                  >
+                    {loading ? 'Confirming Enrollment...' : 'Confirm & Save Recovery Codes →'}
+                  </button>
+
+                  <div className="text-center pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setAuthSubStep('credentials')}
+                      className="text-xs text-ink-muted hover:text-ink font-semibold"
+                    >
+                      ← Back to Password Login
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {/* Step 2B: Emergency Recovery Codes Vault (Shown Once) */}
+              {authSubStep === 'recovery_codes' && (
+                <div className="space-y-4 animate-scale-up">
+                  <div className="text-center space-y-1 pb-1">
+                    <div className="w-10 h-10 rounded-full bg-mint-100 text-mint-700 flex items-center justify-center mx-auto mb-2">
+                      <Key className="w-5 h-5" />
+                    </div>
+                    <h3 className="text-sm font-bold text-ink-strong">
+                      Emergency Recovery Codes
+                    </h3>
+                    <p className="text-xs text-ink-muted">
+                      Save these 8 one-time emergency recovery codes in a secure password manager.
+                    </p>
+                  </div>
+
+                  <div className="p-3 bg-amber-50 border border-amber-300 rounded-xl text-xs text-amber-900 flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-700" />
+                    <span>
+                      <strong>Important:</strong> These codes are displayed <u>only once</u>. If you lose access to your authenticator app, each recovery code can be used exactly once to log in.
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 p-3 bg-slate-100 border border-ink-line rounded-xl font-mono text-xs text-ink-strong text-center">
+                    {recoveryCodes.map((code, idx) => (
+                      <div key={idx} className="bg-white py-1.5 px-2 rounded border border-slate-200 tracking-wider font-semibold">
+                        <span className="text-ink-muted text-[10px] mr-1.5">{idx + 1}.</span>
+                        {code}
+                      </div>
+                    ))}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(recoveryCodes.join('\n'));
+                      setCopiedCodes(true);
+                      setTimeout(() => setCopiedCodes(false), 2500);
+                    }}
+                    className="btn-secondary w-full justify-center text-xs py-2"
+                  >
+                    {copiedCodes ? <Check className="w-3.5 h-3.5 text-mint-700" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{copiedCodes ? 'All Codes Copied to Clipboard!' : 'Copy All Recovery Codes'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleProceedAfterRecoveryCodes}
+                    className="btn-primary w-full justify-center !py-2.5 mt-2 shadow-soft"
+                  >
+                    I Have Saved My Recovery Codes → Enter Portal
+                  </button>
+                </div>
+              )}
+
+              {/* Step 2C: Standard TOTP MFA Verification / Recovery Login */}
+              {authSubStep === 'mfa_verify' && (
                 <form onSubmit={handleMfaVerify} className="space-y-4 animate-scale-up">
                   <div className="text-center space-y-1 pb-2">
                     <div className="w-10 h-10 rounded-full bg-mint-100 text-mint-700 flex items-center justify-center mx-auto mb-2">
                       <ShieldCheck className="w-5 h-5" />
                     </div>
                     <h3 className="text-sm font-bold text-ink-strong">
-                      Two-Factor Authentication (TOTP MFA)
+                      {isRecoveryMode ? 'Emergency Recovery Code' : 'Two-Factor Authentication (TOTP MFA)'}
                     </h3>
                     <p className="text-xs text-ink-muted">
-                      Enter the 6-digit TOTP code for <strong className="text-ink">{email}</strong>.
+                      {isRecoveryMode
+                        ? 'Enter one of your 8-character single-use emergency recovery codes.'
+                        : <>Enter the 6-digit TOTP code for <strong className="text-ink">{email}</strong>.</>}
                     </p>
                   </div>
 
-                  {!isEvalActive ? (
-                    <div className="bg-amberState-100 border border-amberState-700/30 p-3 rounded-xl text-xs text-amberState-700 flex flex-col items-center gap-1.5 text-center">
-                      <div className="flex items-center gap-1.5 font-bold">
-                        <AlertCircle className="w-4 h-4 text-amberState-700" />
-                        <span>Evaluator Mode is currently OFF</span>
-                      </div>
-                      <p className="text-[11px] leading-relaxed">
-                        To use sandbox demo PIN <code className="font-mono font-bold bg-white px-1.5 py-0.5 rounded border border-amberState-700/30">123456</code>, please activate Evaluator Mode.
-                      </p>
-                      <button
-                        type="button"
-                        onClick={() => toggleEvaluatorMode(true)}
-                        className="mt-1 px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-bold transition-all shadow-xs"
-                      >
-                        ⚡ Turn Evaluator Mode ON
-                      </button>
-                    </div>
-                  ) : (
+                  {isEvalActive && !isRecoveryMode && (
                     <div className="bg-mint-100/70 p-3 rounded-xl border border-mint-700/30 text-xs text-mint-800 text-center flex items-center justify-center gap-2">
                       <CheckCircle2 className="w-4 h-4 text-mint-700 shrink-0" />
                       <span><strong>(Evaluator Sandbox Active):</strong> Enter test PIN <code className="font-mono font-bold bg-white px-1.5 py-0.5 rounded border border-mint-700/40">123456</code>.</span>
@@ -705,33 +997,46 @@ export const LoginPage: React.FC = () => {
 
                   <div className="space-y-1.5">
                     <label className="text-xs font-semibold text-ink-strong text-center block">
-                      6-Digit Security PIN
+                      {isRecoveryMode ? 'Emergency Recovery Code (e.g. ABCD-1234)' : '6-Digit Security PIN'}
                     </label>
                     <input
                       type="text"
-                      maxLength={6}
+                      maxLength={isRecoveryMode ? 12 : 6}
                       value={mfaCode}
-                      onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                      onChange={(e) => setMfaCode(isRecoveryMode ? e.target.value.toUpperCase() : e.target.value.replace(/\D/g, '').slice(0, 6))}
                       required
                       autoFocus
-                      placeholder="123456"
-                      className="w-full text-center font-mono text-xl tracking-[0.5em] py-2.5 border border-ink-line rounded-xl focus:outline-none focus:border-blossom-600 focus:ring-1 focus:ring-blossom-600 bg-[#FAFAFA]"
+                      placeholder={isRecoveryMode ? 'XXXX-XXXX' : '123456'}
+                      className={`w-full text-center font-mono text-xl py-2.5 border border-ink-line rounded-xl focus:outline-none focus:border-blossom-600 focus:ring-1 focus:ring-blossom-600 bg-[#FAFAFA] ${
+                        isRecoveryMode ? 'tracking-[0.2em]' : 'tracking-[0.5em]'
+                      }`}
                     />
                   </div>
 
                   <button
                     type="submit"
-                    disabled={loading || mfaCode.replace(/\D/g, '').length < 6}
+                    disabled={loading || (isRecoveryMode ? mfaCode.trim().length < 8 : mfaCode.replace(/\D/g, '').length < 6)}
                     className="btn-primary w-full justify-center !py-2.5 shadow-soft"
                   >
-                    {loading ? 'Verifying TOTP Code...' : 'Verify MFA & Enter Portal →'}
+                    {loading ? 'Verifying Code...' : 'Verify MFA & Enter Portal →'}
                   </button>
 
-                  <div className="text-center pt-2">
+                  <div className="flex flex-col items-center gap-2 pt-2 text-xs">
                     <button
                       type="button"
-                      onClick={() => setMfaStep(false)}
-                      className="text-xs text-ink-muted hover:text-ink font-semibold"
+                      onClick={() => {
+                        setIsRecoveryMode(!isRecoveryMode);
+                        setMfaCode('');
+                        setErrorMessage('');
+                      }}
+                      className="text-blossom-600 hover:underline font-semibold"
+                    >
+                      {isRecoveryMode ? '← Use 6-Digit Authenticator Code' : 'Lost your authenticator device? Use Recovery Code'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAuthSubStep('credentials')}
+                      className="text-ink-muted hover:text-ink font-semibold"
                     >
                       ← Back to Password Login
                     </button>
@@ -1074,6 +1379,7 @@ export const LoginPage: React.FC = () => {
                   return (
                     <button
                       key={persona.role}
+                      data-testid={`persona-${persona.role}`}
                       type="button"
                       onClick={() => handlePersonaClick(persona.role)}
                       className={`text-left p-4 rounded-xl border transition-all hover:shadow-card hover:border-blossom-600/50 hover:-translate-y-0.5 flex flex-col justify-between ${persona.accent}`}
@@ -1114,6 +1420,74 @@ export const LoginPage: React.FC = () => {
           SHA-256 Hash-Chained Audit Ledger Active • DPDP Act 2023 Compliant • Separation of Duties Enforced
         </div>
       </div>
+
+      {/* Sandbox Override Configuration Modal */}
+      {showOverrideModal && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-ink-line space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-ink-line">
+              <div className="flex items-center gap-2">
+                <Mail className="w-5 h-5 text-amber-600" />
+                <h3 className="font-bold text-sm text-ink-strong">Configure Sandbox Real Messages</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowOverrideModal(false)}
+                className="text-ink-muted hover:text-ink text-sm font-bold"
+              >
+                ✕
+              </button>
+            </div>
+            <p className="text-xs text-ink-muted leading-relaxed">
+              In Sandbox mode, real emails and WhatsApp notifications are routed <strong>ONLY</strong> to your test recipient, never to the synthetic institutions&apos; fake addresses.
+            </p>
+            <div className="space-y-3">
+              <div className="space-y-1">
+                <label className="text-xs font-semibold text-ink-strong">Override Test Email</label>
+                <input
+                  type="email"
+                  value={overrideEmailInput}
+                  onChange={(e) => setOverrideEmailInput(e.target.value)}
+                  placeholder="evaluator@example.com"
+                  className="w-full px-3 py-2 text-xs border border-ink-line rounded-lg focus:outline-none focus:border-amber-500"
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-semibold text-ink-strong">Override WhatsApp Number (E.164)</label>
+                <input
+                  type="text"
+                  value={overrideWhatsappInput}
+                  onChange={(e) => setOverrideWhatsappInput(e.target.value)}
+                  placeholder="+919876543210"
+                  className="w-full px-3 py-2 text-xs border border-ink-line rounded-lg focus:outline-none focus:border-amber-500"
+                />
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowOverrideModal(false)}
+                className="px-3 py-1.5 text-xs text-ink-muted hover:text-ink font-semibold"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={savingOverride}
+                onClick={async () => {
+                  setSavingOverride(true);
+                  await updateSandboxOverride(overrideEmailInput, overrideWhatsappInput);
+                  setSavingOverride(false);
+                  setShowOverrideModal(false);
+                }}
+                className="btn-primary text-xs !py-1.5 px-4 bg-amber-500 hover:bg-amber-600 text-slate-950 font-bold border-amber-600"
+              >
+                {savingOverride ? 'Saving...' : 'Save Override'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

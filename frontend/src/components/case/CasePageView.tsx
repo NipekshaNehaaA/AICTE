@@ -30,7 +30,11 @@ import {
   ExternalLink,
   Layers,
   FileSpreadsheet,
-  AlertCircle
+  AlertCircle,
+  Users,
+  X,
+  Shield,
+  Info
 } from 'lucide-react';
 
 export const CasePageView: React.FC = () => {
@@ -46,6 +50,20 @@ export const CasePageView: React.FC = () => {
   const [resendingAlertId, setResendingAlertId] = useState<string | null>(null);
   const [resendStatus, setResendStatus] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  // Shared With Panel State
+  const [selectedSharedDoc, setSelectedSharedDoc] = useState<any | null>(null);
+  const [sharedWithOpen, setSharedWithOpen] = useState<boolean>(false);
+  const [sharedWithLoading, setSharedWithLoading] = useState<boolean>(false);
+  const [sharedWithData, setSharedWithData] = useState<any | null>(null);
+  const [sharedWithError, setSharedWithError] = useState<string | null>(null);
+  const [sharedWithTab, setSharedWithTab] = useState<'VIEWERS' | 'HISTORY'>('VIEWERS');
+
+  // Preview Modal State
+  const [previewDoc, setPreviewDoc] = useState<any | null>(null);
+  const [previewLoading, setPreviewLoading] = useState<boolean>(false);
+  const [previewBlobUrl, setPreviewBlobUrl] = useState<string | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
 
   // File upload input ref
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -71,24 +89,31 @@ export const CasePageView: React.FC = () => {
   }, [currentRegion.code]);
 
   // Load single case docket whenever selectedAppId changes
-  const fetchCaseDocket = async (appId: string) => {
+  // Load single case docket whenever selectedAppId changes with live 5-second polling
+  const fetchCaseDocket = async (appId: string, isSilent = false) => {
     try {
-      setLoading(true);
+      if (!isSilent) setLoading(true);
       setErrorMsg(null);
       const data = await apiFetch<any>(`/api/v1/applications/${appId}`);
       setCaseData(data);
     } catch (err: any) {
       console.error('Failed to load case docket', err);
-      setErrorMsg(err?.message || 'Access restricted or application not found in your permitted slice.');
-      setCaseData(null);
+      if (!isSilent) {
+        setErrorMsg(err?.message || 'Access restricted or application not found in your permitted slice.');
+        setCaseData(null);
+      }
     } finally {
-      setLoading(false);
+      if (!isSilent) setLoading(false);
     }
   };
 
   useEffect(() => {
     if (selectedAppId) {
-      fetchCaseDocket(selectedAppId);
+      fetchCaseDocket(selectedAppId, false);
+      const interval = setInterval(() => {
+        fetchCaseDocket(selectedAppId, true);
+      }, 5000);
+      return () => clearInterval(interval);
     }
   }, [selectedAppId]);
 
@@ -100,10 +125,12 @@ export const CasePageView: React.FC = () => {
 
   const handleDirectDownload = async (docId: string, filename: string) => {
     const token = currentUser.token || (typeof window !== 'undefined' ? localStorage.getItem('aicte_auth_token') : '') || '';
+    const ws = typeof window !== 'undefined' ? (localStorage.getItem('aicte_workspace') || 'sandbox') : 'sandbox';
     try {
-      const res = await fetch(`${API_BASE}/api/v1/documents/${docId}/download`, {
+      const res = await fetch(`${API_BASE}/api/v1/compliance/documents/${docId}/download`, {
         headers: {
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${token}`,
+          'X-Workspace': ws,
         }
       });
       if (!res.ok) {
@@ -122,6 +149,53 @@ export const CasePageView: React.FC = () => {
       document.body.removeChild(a);
     } catch (err) {
       alert(`Download error: ${err}`);
+    }
+  };
+
+  const handlePreview = async (doc: any) => {
+    setPreviewDoc(doc);
+    setPreviewLoading(true);
+    setPreviewError(null);
+    setPreviewBlobUrl(null);
+
+    const token = currentUser.token || (typeof window !== 'undefined' ? localStorage.getItem('aicte_auth_token') : '') || '';
+    const ws = typeof window !== 'undefined' ? (localStorage.getItem('aicte_workspace') || 'sandbox') : 'sandbox';
+
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/compliance/documents/${doc.id}/preview`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'X-Workspace': ws,
+        }
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setPreviewError(err.detail || `Access Denied (${res.status}): You are not currently authorized to view this document.`);
+        return;
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      setPreviewBlobUrl(url);
+    } catch (err: any) {
+      setPreviewError(err.message || 'Failed to load document preview');
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const handleOpenSharedWith = async (doc: any) => {
+    setSelectedSharedDoc(doc);
+    setSharedWithOpen(true);
+    setSharedWithLoading(true);
+    setSharedWithError(null);
+
+    try {
+      const data = await apiFetch<any>(`/api/v1/compliance/documents/${doc.id}/access-control`);
+      setSharedWithData(data);
+    } catch (err: any) {
+      setSharedWithError(err.message || 'Failed to retrieve access control list');
+    } finally {
+      setSharedWithLoading(false);
     }
   };
 
@@ -603,13 +677,36 @@ export const CasePageView: React.FC = () => {
                             </span>
                           </td>
                           <td className="p-3 text-right">
-                            <button
-                              onClick={() => handleDirectDownload(doc.id, doc.file_name)}
-                              className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-ink-strong rounded transition-colors"
-                            >
-                              <Download className="w-3.5 h-3.5 text-blossom-600" />
-                              <span>Download</span>
-                            </button>
+                            <div className="flex items-center justify-end gap-1.5">
+                              {/* Preview Button */}
+                              <button
+                                onClick={() => handlePreview(doc)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold bg-white border border-ink-line hover:bg-slate-50 text-ink-strong rounded transition-colors"
+                                title="Preview Document"
+                              >
+                                <Eye className="w-3.5 h-3.5 text-blue-600" />
+                                <span>Preview</span>
+                              </button>
+
+                              {/* Shared With Button */}
+                              <button
+                                onClick={() => handleOpenSharedWith(doc)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold bg-white border border-ink-line hover:bg-rose-50 text-ink-strong rounded transition-colors"
+                                title="View Authorized Stakeholders & Audit Trail"
+                              >
+                                <Users className="w-3.5 h-3.5 text-blossom-600" />
+                                <span>Shared with</span>
+                              </button>
+
+                              {/* Download Button */}
+                              <button
+                                onClick={() => handleDirectDownload(doc.id, doc.file_name)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-ink-strong rounded transition-colors"
+                              >
+                                <Download className="w-3.5 h-3.5 text-blossom-600" />
+                                <span>Download</span>
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))
@@ -1008,6 +1105,304 @@ export const CasePageView: React.FC = () => {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* SHARED WITH SLIDE-OVER DRAWER */}
+      {sharedWithOpen && (
+        <div className="fixed inset-0 z-50 flex justify-end bg-black/40 backdrop-blur-xs transition-opacity animate-in fade-in duration-200">
+          <div className="w-full max-w-xl bg-white h-full shadow-2xl flex flex-col border-l border-ink-line animate-in slide-in-from-right duration-300">
+            {/* Drawer Header */}
+            <div className="p-5 border-b border-ink-line bg-slate-50 flex items-start justify-between">
+              <div>
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 rounded-lg bg-blossom-100 text-blossom-600 flex items-center justify-center font-bold">
+                    <Users className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-bold text-ink-strong">
+                      Access Control & Shared Stakeholders
+                    </h3>
+                    <p className="text-xs text-ink-muted">
+                      {selectedSharedDoc?.document_type || 'STATUTORY_DOCUMENT'} &bull; {selectedSharedDoc?.file_name}
+                    </p>
+                  </div>
+                </div>
+                {selectedSharedDoc?.sha256_hash && (
+                  <div className="mt-2 text-[10px] font-mono text-ink-muted bg-white border border-ink-line rounded px-2 py-0.5 inline-flex items-center gap-1">
+                    <Lock className="w-3 h-3 text-emerald-600" />
+                    <span>SHA-256: {selectedSharedDoc.sha256_hash.slice(0, 20)}...</span>
+                  </div>
+                )}
+              </div>
+              <button
+                onClick={() => {
+                  setSharedWithOpen(false);
+                  setSelectedSharedDoc(null);
+                  setSharedWithData(null);
+                }}
+                className="p-1 rounded-md text-ink-muted hover:text-ink-strong hover:bg-slate-200 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Navigation Tabs */}
+            <div className="flex border-b border-ink-line px-5 bg-white">
+              <button
+                onClick={() => setSharedWithTab('VIEWERS')}
+                className={`py-3 text-xs font-bold border-b-2 transition-all flex items-center gap-1.5 ${
+                  sharedWithTab === 'VIEWERS'
+                    ? 'border-blossom-600 text-blossom-600'
+                    : 'border-transparent text-ink-muted hover:text-ink-strong'
+                }`}
+              >
+                <Shield className="w-3.5 h-3.5" />
+                <span>Authorized Viewers ({sharedWithData?.authorized_viewers?.length || 0})</span>
+              </button>
+              <button
+                onClick={() => setSharedWithTab('HISTORY')}
+                className={`py-3 text-xs font-bold border-b-2 ml-4 transition-all flex items-center gap-1.5 ${
+                  sharedWithTab === 'HISTORY'
+                    ? 'border-blossom-600 text-blossom-600'
+                    : 'border-transparent text-ink-muted hover:text-ink-strong'
+                }`}
+              >
+                <ShieldCheck className="w-3.5 h-3.5" />
+                <span>Access History Audit ({sharedWithData?.access_history?.length || 0})</span>
+              </button>
+            </div>
+
+            {/* Drawer Body Content */}
+            <div className="flex-1 overflow-y-auto p-5 space-y-4">
+              {sharedWithLoading ? (
+                <div className="flex flex-col items-center justify-center py-16 text-ink-muted space-y-2">
+                  <RefreshCw className="w-6 h-6 animate-spin text-blossom-600" />
+                  <span className="text-xs">Resolving live stage assignments and statutory permissions...</span>
+                </div>
+              ) : sharedWithError ? (
+                <div className="p-4 bg-rose-50 border border-rose-200 rounded-lg text-rose-800 text-xs">
+                  {sharedWithError}
+                </div>
+              ) : sharedWithTab === 'VIEWERS' ? (
+                <div className="space-y-3">
+                  <div className="p-3 bg-blossom-50 rounded-lg border border-blossom-200 text-xs text-blossom-900 leading-relaxed">
+                    <strong>Dynamic Stage-Based Boundary:</strong> Document access is strictly scoped to reviewers actively assigned to the active stage ({sharedWithData?.current_stage || caseData?.current_stage || 'ACTIVE'}). When the stage is advanced, previous stage assignments are revoked automatically.
+                  </div>
+
+                  {(!sharedWithData?.authorized_viewers || sharedWithData.authorized_viewers.length === 0) ? (
+                    <div className="p-6 text-center text-xs text-ink-muted border border-dashed border-ink-line rounded-lg">
+                      No authorized reviewers currently assigned.
+                    </div>
+                  ) : (
+                    sharedWithData.authorized_viewers.map((viewer: any, idx: number) => (
+                      <div
+                        key={viewer.user_id || idx}
+                        className="p-3.5 rounded-lg border border-ink-line hover:border-blossom-200 bg-white shadow-xs space-y-2"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <div className="text-xs font-bold text-ink-strong flex items-center gap-2">
+                              <span>{viewer.name}</span>
+                              <span className="w-2 h-2 rounded-full bg-emerald-500" title="Active Permission" />
+                            </div>
+                            <div className="text-[11px] text-ink-muted font-mono">{viewer.email}</div>
+                          </div>
+                          <div className="flex flex-col items-end gap-1">
+                            <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-100 text-ink-strong font-mono">
+                              {viewer.role}
+                            </span>
+                            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                              viewer.access_type === 'STAGE_ASSIGNEE'
+                                ? 'bg-blossom-100 text-blossom-700'
+                                : viewer.access_type === 'REGIONAL_JURISDICTION'
+                                ? 'bg-blue-100 text-blue-700'
+                                : viewer.access_type === 'SUBMITTING_INSTITUTION'
+                                ? 'bg-mint-100 text-mint-700'
+                                : 'bg-slate-100 text-ink-slate'
+                            }`}>
+                              {viewer.access_type}
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="text-[11px] text-ink-slate bg-slate-50 p-2 rounded border border-ink-line">
+                          <span className="font-semibold text-ink-muted">Statutory Basis: </span>
+                          <span>{viewer.statutory_basis}</span>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="p-3 bg-slate-50 rounded-lg border border-ink-line text-xs text-ink-muted">
+                    Immutable SHA-256 access logs. Every view, download, or verification event on this document is permanently cryptographically chained.
+                  </div>
+
+                  {(!sharedWithData?.access_history || sharedWithData.access_history.length === 0) ? (
+                    <div className="p-6 text-center text-xs text-ink-muted border border-dashed border-ink-line rounded-lg">
+                      No access trail recorded yet for this document.
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {sharedWithData.access_history.map((log: any, idx: number) => (
+                        <div
+                          key={idx}
+                          className="p-3 bg-white border border-ink-line rounded-lg text-xs space-y-1.5 font-mono"
+                        >
+                          <div className="flex items-center justify-between font-sans">
+                            <span className="font-bold text-ink-strong text-xs">{log.user_email}</span>
+                            <span className="text-[10px] font-bold bg-blossom-100 text-blossom-700 px-1.5 py-0.5 rounded">
+                              {log.action_type}
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-ink-muted font-sans flex items-center justify-between">
+                            <span>Role: {log.user_role}</span>
+                            <span>{new Date(log.timestamp).toLocaleString()}</span>
+                          </div>
+                          <div className="pt-1 border-t border-ink-line/60 grid grid-cols-2 gap-2 text-[10px] text-ink-slate">
+                            <div className="truncate" title={log.prev_entry_hash}>
+                              Prev: {log.prev_entry_hash ? log.prev_entry_hash.slice(0, 12) + '...' : 'GENESIS'}
+                            </div>
+                            <div className="truncate text-blossom-600 font-bold" title={log.curr_entry_hash}>
+                              Hash: {log.curr_entry_hash ? log.curr_entry_hash.slice(0, 14) + '...' : 'N/A'}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Drawer Footer */}
+            <div className="p-4 border-t border-ink-line bg-slate-50 flex items-center justify-between text-xs">
+              <span className="text-ink-muted">AICTE APH 2024-27 Regulatory Governance</span>
+              <button
+                onClick={() => {
+                  setSharedWithOpen(false);
+                  setSelectedSharedDoc(null);
+                  setSharedWithData(null);
+                }}
+                className="px-4 py-1.5 bg-white border border-ink-line rounded-lg text-ink-strong font-semibold hover:bg-slate-100"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* DOCUMENT PREVIEW MODAL */}
+      {previewDoc && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-xs transition-opacity animate-in fade-in duration-200">
+          <div className="bg-white rounded-2xl shadow-2xl border border-ink-line w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden">
+            {/* Modal Header */}
+            <div className="p-4 border-b border-ink-line bg-slate-50 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-lg bg-blue-100 text-blue-600 flex items-center justify-center font-bold">
+                  <Eye className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-ink-strong">
+                    Document Secure Preview
+                  </h3>
+                  <p className="text-xs text-ink-muted">
+                    {previewDoc.document_type || 'DOCUMENT'} &bull; {previewDoc.file_name}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                {previewDoc.sha256_hash && (
+                  <span className="hidden sm:inline-flex text-[10px] font-mono bg-mint-100 text-mint-700 px-2.5 py-1 rounded font-bold items-center gap-1">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>SHA-256 Verified</span>
+                  </span>
+                )}
+                <button
+                  onClick={() => {
+                    if (previewBlobUrl) window.URL.revokeObjectURL(previewBlobUrl);
+                    setPreviewDoc(null);
+                    setPreviewBlobUrl(null);
+                    setPreviewError(null);
+                  }}
+                  className="p-1 rounded-md text-ink-muted hover:text-ink-strong hover:bg-slate-200 transition-colors"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Modal Body */}
+            <div className="flex-1 overflow-y-auto p-4 flex flex-col items-center justify-center min-h-[450px] bg-slate-100/50">
+              {previewLoading ? (
+                <div className="flex flex-col items-center justify-center space-y-3 py-12">
+                  <RefreshCw className="w-8 h-8 animate-spin text-blossom-600" />
+                  <p className="text-xs font-medium text-ink-strong">
+                    Verifying role assignment & checking SHA-256 integrity...
+                  </p>
+                  <p className="text-[11px] text-ink-muted">
+                    Logging access to the immutable compliance ledger.
+                  </p>
+                </div>
+              ) : previewError ? (
+                <div className="max-w-md w-full p-5 bg-rose-50 border border-rose-200 rounded-xl text-center space-y-3">
+                  <div className="w-10 h-10 rounded-full bg-rose-100 text-rose-600 flex items-center justify-center mx-auto">
+                    <AlertTriangle className="w-5 h-5" />
+                  </div>
+                  <h4 className="text-sm font-bold text-rose-900">Access Restricted (403 Forbidden)</h4>
+                  <p className="text-xs text-rose-800 leading-relaxed">
+                    {previewError}
+                  </p>
+                  <div className="text-[11px] text-rose-700 bg-white/70 p-2 rounded border border-rose-200">
+                    Regulatory Rule: Only institutional owners and officers actively assigned to this review stage may inspect docket documents.
+                  </div>
+                </div>
+              ) : previewBlobUrl ? (
+                <div className="w-full h-full flex flex-col space-y-2">
+                  <div className="w-full flex items-center justify-between text-xs px-2 py-1 bg-white border border-ink-line rounded-lg">
+                    <span className="text-[11px] text-emerald-700 font-semibold flex items-center gap-1">
+                      <ShieldCheck className="w-3.5 h-3.5" />
+                      Cryptographically Validated Against Genesis Ledger
+                    </span>
+                    <button
+                      onClick={() => handleDirectDownload(previewDoc.id, previewDoc.file_name)}
+                      className="text-blossom-600 hover:text-blossom-700 font-semibold flex items-center gap-1 text-[11px]"
+                    >
+                      <Download className="w-3 h-3" />
+                      <span>Download File</span>
+                    </button>
+                  </div>
+                  <iframe
+                    src={previewBlobUrl}
+                    className="w-full h-[540px] rounded-lg border border-ink-line bg-white shadow-inner"
+                    title="Document Preview"
+                  />
+                </div>
+              ) : null}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-3 border-t border-ink-line bg-slate-50 flex items-center justify-between text-xs">
+              <span className="text-[11px] font-mono text-ink-muted">
+                {previewDoc.sha256_hash ? `Hash: ${previewDoc.sha256_hash.slice(0, 32)}...` : ''}
+              </span>
+              <button
+                onClick={() => {
+                  if (previewBlobUrl) window.URL.revokeObjectURL(previewBlobUrl);
+                  setPreviewDoc(null);
+                  setPreviewBlobUrl(null);
+                  setPreviewError(null);
+                }}
+                className="px-4 py-1.5 bg-white border border-ink-line rounded-lg text-ink-strong font-semibold hover:bg-slate-100"
+              >
+                Close Preview
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

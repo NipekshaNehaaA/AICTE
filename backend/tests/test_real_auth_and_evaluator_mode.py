@@ -19,6 +19,7 @@ Tests:
 
 import os
 import pytest
+import hashlib
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
@@ -26,6 +27,7 @@ from app.config import settings
 from app.database import SessionLocal
 from app.models import User, Institution, Region, AuditTrail
 from app.auth import create_access_token, hash_password
+from app.email_service import email_service
 from tests.http_client import AppTestClient
 
 client = AppTestClient()
@@ -57,15 +59,20 @@ def test_institution_signup_and_email_verification():
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert data["status"] == "SUCCESS"
-        assert data["email"] == "registrar.apex@tech-edu.in"
-        v_token = data["verification_token"]
+        # Security: verification token must NOT be returned in HTTP response
+        assert "verification_token" not in data
+
+        # Security test hook: retrieve token from in-memory test outbox
+        v_token = email_service.get_latest_token("registrar.apex@tech-edu.in")
+        assert v_token is not None
         assert len(v_token) > 20
 
-        # 2. Check DB State: User unverified, Institution PENDING_VERIFICATION
+        # 2. Check DB State: User unverified, token hashed with SHA-256, Institution PENDING_VERIFICATION
         user = db.query(User).filter(User.email == "registrar.apex@tech-edu.in").first()
         assert user is not None
         assert user.email_verified is False
         assert user.role == "INSTITUTION_USER"
+        assert user.verification_token == hashlib.sha256(v_token.encode("utf-8")).hexdigest()
         assert user.institution is not None
         assert user.institution.status == "PENDING_VERIFICATION"
 
@@ -123,11 +130,16 @@ def test_password_reset_flow():
         # 1. Request Password Reset
         forgot_resp = client.post("/api/v1/auth/forgot-password", json={"email": test_email})
         assert forgot_resp.status_code == 200
-        reset_token = forgot_resp.json().get("reset_token")
+        # Security: reset token must NEVER be returned in HTTP response
+        assert "reset_token" not in forgot_resp.json()
+
+        # Retrieve token from in-memory test outbox
+        reset_token = email_service.get_latest_token(test_email)
         assert reset_token is not None
 
         db.refresh(user)
-        assert user.reset_password_token == reset_token
+        # Token must be stored as SHA-256 hash
+        assert user.reset_password_token == hashlib.sha256(reset_token.encode("utf-8")).hexdigest()
         assert user.reset_token_expires_at > datetime.utcnow()
 
         # 2. Reset Password with token
@@ -255,13 +267,26 @@ def test_officer_account_provisioning_and_rbac():
 def test_evaluator_mode_toggle_and_gating():
     """
     Validates dynamic runtime Evaluator Mode toggle:
+    Anonymous call returns 404.
+    SUPER_ADMIN call toggles mode when EVALUATOR_ALLOW_TOGGLE=True in non-production.
     When OFF: demo personas return 403 Forbidden.
     When ON: demo personas return 200 OK.
     """
     orig_mode = settings.DEMO_MODE
+    orig_eval = getattr(settings, "EVALUATOR_MODE", False)
+    orig_toggle = getattr(settings, "EVALUATOR_ALLOW_TOGGLE", False)
     try:
-        # 1. Turn Evaluator Mode OFF
-        toggle_off = client.post("/api/v1/system/evaluator-mode", json={"enabled": False})
+        settings.EVALUATOR_ALLOW_TOGGLE = True
+
+        # Anonymous toggle must fail with 404
+        anon_resp = client.post("/api/v1/system/evaluator-mode", json={"enabled": False})
+        assert anon_resp.status_code == 404
+
+        admin_token = create_access_token({"sub": "admin-1", "role": "SUPER_ADMIN"})
+        headers = {"Authorization": f"Bearer {admin_token}"}
+
+        # 1. Turn Evaluator Mode OFF with SUPER_ADMIN
+        toggle_off = client.post("/api/v1/system/evaluator-mode", headers=headers, json={"enabled": False})
         assert toggle_off.status_code == 200
         assert toggle_off.json()["evaluator_mode"] is False
 
@@ -269,8 +294,8 @@ def test_evaluator_mode_toggle_and_gating():
         off_resp = client.get("/api/v1/auth/personas")
         assert off_resp.status_code == 403
 
-        # 2. Turn Evaluator Mode ON
-        toggle_on = client.post("/api/v1/system/evaluator-mode", json={"enabled": True})
+        # 2. Turn Evaluator Mode ON with SUPER_ADMIN
+        toggle_on = client.post("/api/v1/system/evaluator-mode", headers=headers, json={"enabled": True})
         assert toggle_on.status_code == 200
         assert toggle_on.json()["evaluator_mode"] is True
 
@@ -281,4 +306,5 @@ def test_evaluator_mode_toggle_and_gating():
 
     finally:
         settings.DEMO_MODE = orig_mode
-        settings.EVALUATOR_MODE = orig_mode
+        settings.EVALUATOR_MODE = orig_eval
+        settings.EVALUATOR_ALLOW_TOGGLE = orig_toggle

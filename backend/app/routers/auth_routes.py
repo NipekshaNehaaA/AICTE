@@ -15,9 +15,12 @@ Implements Task 3:
 """
 
 import secrets
+import json
+import hashlib
+import time
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Header, status
+from fastapi import APIRouter, Depends, HTTPException, Header, Request, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
@@ -37,7 +40,24 @@ from app.auth import (
     check_account_lockout,
     record_login_failure,
     record_login_success,
+    encrypt_mfa_secret,
+    decrypt_mfa_secret,
+    generate_totp_secret,
+    generate_provisioning_uri,
+    generate_qr_code_data_uri,
+    generate_recovery_codes,
+    hash_recovery_code,
+    verify_and_consume_recovery_code,
+    verify_totp_rfc6238,
+    check_rate_limit,
+    validate_password_policy,
 )
+
+def get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "127.0.0.1"
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication & Access Control"])
 
@@ -70,16 +90,28 @@ class MFAVerifyRequest(BaseModel):
     email: str
     mfa_code: str
 
+class MFAEnrollConfirmRequest(BaseModel):
+    email: str
+    mfa_code: str
+
 class LoginResponse(BaseModel):
     mfa_required: bool
+    mfa_enrollment_required: Optional[bool] = False
+    provisioning_uri: Optional[str] = None
+    qr_code_base64: Optional[str] = None
+    manual_entry_key: Optional[str] = None
+    recovery_codes: Optional[List[str]] = None
     email: str
     full_name: str
     role: str
     region_code: Optional[str] = None
     institution_id: Optional[str] = None
+    institution_name: Optional[str] = None
+    institution_pid: Optional[str] = None
     access_token: Optional[str] = None
     refresh_token: Optional[str] = None
     default_route: Optional[str] = None
+    must_change_password: Optional[bool] = False
     message: str
 
 class SignUpRequest(BaseModel):
@@ -105,6 +137,10 @@ class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str
 
+class ChangePasswordRequest(BaseModel):
+    old_password: Optional[str] = None
+    new_password: str
+
 class RefreshTokenRequest(BaseModel):
     refresh_token: str
 
@@ -123,12 +159,15 @@ class CreateOfficerRequest(BaseModel):
 # -----------------------------------------------------------------------------
 
 @router.get("/personas")
-def get_demo_personas(db: Session = Depends(get_db)):
-    """Returns curated demo personas for 1-click evaluation (Demo Only). Disabled if Evaluator / Demo Mode is False."""
-    if not settings.DEMO_MODE:
+@router.get("/demo-personas")
+def get_demo_personas(request: Request, db: Session = Depends(get_db)):
+    """Returns curated demo personas for 1-click evaluation (Demo Only). Disabled in Live workspace."""
+    from app.workspace import resolve_workspace
+    ws = resolve_workspace(request)
+    if ws != "sandbox":
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="1-click demo personas are disabled in production mode. Please enable Evaluator Mode.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not Found: Personas endpoint is only available in Sandbox workspace.",
         )
     return {
         "personas": [
@@ -254,7 +293,7 @@ def get_demo_personas(db: Session = Depends(get_db)):
 # -----------------------------------------------------------------------------
 
 @router.post("/login", response_model=LoginResponse)
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
+def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)):
     """
     Step 1 of Authentication:
     Validates email + password with PBKDF2 hash and checks brute-force lockout.
@@ -284,6 +323,13 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
             detail="Invalid email or password. Please verify credentials."
         )
 
+    if user.is_active is False:
+        record_login_failure(email)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is disabled. Please contact system administrator."
+        )
+
     # Enforce email verification for active accounts
     if user.email_verified is False:
         raise HTTPException(
@@ -296,29 +342,87 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
     reg_code = user.region.code if user.region else "HQ"
     default_route = get_default_route_for_role(user.role)
+    inst_name = user.institution.name if user.institution and user.role == "INSTITUTION_USER" else None
+    inst_pid = user.institution.permanent_id if user.institution and user.role == "INSTITUTION_USER" else None
 
-    # If MFA is enabled, mandate Step 2
-    if user.mfa_enabled:
+    # Check if MFA is required based on user configuration
+    requires_mfa = bool(user.mfa_enabled)
+    if requires_mfa:
+        # Check if officer has enrolled yet
+        if not user.mfa_secret:
+            secret = generate_totp_secret()
+            user.mfa_pending_secret = encrypt_mfa_secret(secret)
+            user.mfa_enabled = True
+            db.commit()
+
+            prov_uri = generate_provisioning_uri(user.email, secret)
+            qr_uri = generate_qr_code_data_uri(prov_uri)
+
+            from app.workspace import resolve_workspace
+            ws = resolve_workspace(request)
+            msg = "Two-factor authentication enrollment required. Please scan the QR code with your authenticator app and enter the 6-digit confirmation code."
+            if ws == "sandbox":
+                msg += " (Demo mode active: you may also enter '123456')."
+
+            return LoginResponse(
+                mfa_required=True,
+                mfa_enrollment_required=True,
+                provisioning_uri=prov_uri,
+                qr_code_base64=qr_uri,
+                manual_entry_key=secret,
+                email=user.email,
+                full_name=user.full_name,
+                role=user.role,
+                region_code=reg_code,
+                institution_id=user.institution_id,
+                institution_name=inst_name,
+                institution_pid=inst_pid,
+                default_route=default_route,
+                message=msg
+            )
+
+        from app.workspace import resolve_workspace
+        ws = resolve_workspace(request)
+        msg = "Password verified. Please enter the 6-digit two-factor authentication code."
+        if ws == "sandbox":
+            msg += " (Demo: 123456)."
         return LoginResponse(
             mfa_required=True,
+            mfa_enrollment_required=False,
             email=user.email,
             full_name=user.full_name,
             role=user.role,
             region_code=reg_code,
             institution_id=user.institution_id,
+            institution_name=inst_name,
+            institution_pid=inst_pid,
             default_route=default_route,
-            message="Password verified. Please enter the 6-digit TOTP code (Demo: 123456)."
+            message=msg
         )
 
     # Direct token issuance if MFA disabled
+    from app.workspace import resolve_workspace
+    ws = resolve_workspace(request)
+    is_pw_change_required = bool(user.must_change_password)
     access_token = create_access_token({
         "sub": user.id,
         "email": user.email,
         "role": user.role,
         "region_id": user.region_id,
         "institution_id": user.institution_id,
-    })
-    refresh_token = create_refresh_token({"sub": user.id, "role": user.role})
+        "token_version": user.token_version or 0,
+        "must_change_password": is_pw_change_required,
+        "scope": "PASSWORD_CHANGE_REQUIRED" if is_pw_change_required else "FULL_ACCESS",
+        "type": "password_change_required" if is_pw_change_required else "access",
+        "ws": ws,
+    }, workspace=ws)
+    refresh_token = create_refresh_token({
+        "sub": user.id,
+        "role": user.role,
+        "token_version": user.token_version or 0,
+        "must_change_password": is_pw_change_required,
+        "ws": ws,
+    }, workspace=ws)
 
     # Log successful login to hash-chained audit ledger
     try:
@@ -340,55 +444,240 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         role=user.role,
         region_code=reg_code,
         institution_id=user.institution_id,
+        institution_name=inst_name,
+        institution_pid=inst_pid,
         access_token=access_token,
         refresh_token=refresh_token,
-        default_route=default_route,
-        message="Authentication successful."
+        default_route="/auth/change-password" if is_pw_change_required else default_route,
+        must_change_password=is_pw_change_required,
+        message="Initial password change required before accessing other APIs." if is_pw_change_required else "Authentication successful."
     )
 
-@router.post("/mfa-verify", response_model=LoginResponse)
-def verify_mfa(payload: MFAVerifyRequest, db: Session = Depends(get_db)):
+@router.post("/mfa-enroll-confirm", response_model=LoginResponse)
+def confirm_mfa_enrollment(payload: MFAEnrollConfirmRequest, request: Request, db: Session = Depends(get_db)):
     """
-    Step 2 of Authentication:
-    Validates 6-digit Time-Based OTP (TOTP) code (Demo code: 123456).
-    Issues JWT access & refresh tokens upon success, and logs audit entry.
+    Step 2b of Authentication: Confirms TOTP enrollment.
+    Verifies code against pending secret, saves encrypted secret, generates recovery codes,
+    and returns initial tokens + recovery codes.
     """
     email = payload.email.strip().lower()
+    lockout_err = check_account_lockout(email)
+    if lockout_err:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=lockout_err)
+
     user = db.query(User).filter(User.email == email).first()
     if not user:
+        record_login_failure(email)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User account not found.")
 
-    if not verify_mfa_code(user.mfa_secret, payload.mfa_code.strip()):
-        if not settings.DEMO_MODE:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid TOTP code. Evaluator Mode is currently OFF (production mode). Please toggle 'Evaluator Mode: ON' at the top right to use demo PIN '123456'."
-            )
+    if user.is_active is False:
+        record_login_failure(email)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is disabled. Please contact system administrator.")
+
+    if not user.mfa_pending_secret and not user.mfa_secret:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid TOTP code. For demonstration, please enter '123456'."
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No pending MFA enrollment found for this user."
         )
+
+    secret_encrypted = user.mfa_pending_secret or user.mfa_secret
+    secret_plain = decrypt_mfa_secret(secret_encrypted)
+
+    clean_code = payload.mfa_code.replace(" ", "").replace("-", "").strip()
+
+    from app.workspace import resolve_workspace
+    ws = resolve_workspace(request)
+    is_valid = verify_totp_rfc6238(secret_plain, clean_code)
+    if not is_valid and clean_code == "123456" and ws == "sandbox":
+        is_valid = True
+
+    if not is_valid:
+        record_login_failure(email)
+        err_msg = "Invalid verification code. Please check your authenticator app and try again."
+        if ws == "sandbox":
+            err_msg += " (Demo PIN: 123456)."
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=err_msg)
+
+    # Success: confirm secret and record timestep
+    record_login_success(email)
+    current_step = int(datetime.utcnow().timestamp() / 30)
+    user.last_mfa_timestep = current_step
+    user.mfa_secret = secret_encrypted
+    user.mfa_pending_secret = None
+    user.mfa_enabled = True
+
+    raw_recovery_codes = generate_recovery_codes(8)
+    hashed_codes = [hash_recovery_code(user.id, code) for code in raw_recovery_codes]
+    user.mfa_recovery_codes = json.dumps(hashed_codes)
+    db.commit()
 
     reg_code = user.region.code if user.region else "HQ"
     default_route = get_default_route_for_role(user.role)
+    inst_name = user.institution.name if user.institution and user.role == "INSTITUTION_USER" else None
+    inst_pid = user.institution.permanent_id if user.institution and user.role == "INSTITUTION_USER" else None
 
+    is_pw_change_required = bool(user.must_change_password)
     access_token = create_access_token({
         "sub": user.id,
         "email": user.email,
         "role": user.role,
         "region_id": user.region_id,
         "institution_id": user.institution_id,
-    })
-    refresh_token = create_refresh_token({"sub": user.id, "role": user.role})
+        "token_version": user.token_version or 0,
+        "must_change_password": is_pw_change_required,
+        "scope": "PASSWORD_CHANGE_REQUIRED" if is_pw_change_required else "FULL_ACCESS",
+        "type": "password_change_required" if is_pw_change_required else "access",
+        "ws": ws,
+    }, workspace=ws)
+    refresh_token = create_refresh_token({
+        "sub": user.id,
+        "role": user.role,
+        "token_version": user.token_version or 0,
+        "must_change_password": is_pw_change_required,
+        "ws": ws,
+    }, workspace=ws)
 
-    # Log MFA login to hash-chained audit ledger
     try:
         ctx = RequestContext(user_id=user.id, role=user.role, region_id=user.region_id, institution_id=user.institution_id)
         ScopedDAL(db, ctx).append_audit_entry(
-            action_type="USER_LOGIN_MFA_SUCCESS",
+            action_type="MFA_ENROLLED",
             entity_type="User",
             entity_id=user.id,
-            metadata={"email": user.email, "role": user.role, "mfa_used": True}
+            metadata={"email": user.email, "role": user.role, "method": "TOTP_RFC6238"}
+        )
+        db.commit()
+    except Exception:
+        pass
+
+    return LoginResponse(
+        mfa_required=False,
+        mfa_enrollment_required=False,
+        recovery_codes=raw_recovery_codes,
+        email=user.email,
+        full_name=user.full_name,
+        role=user.role,
+        region_code=reg_code,
+        institution_id=user.institution_id,
+        institution_name=inst_name,
+        institution_pid=inst_pid,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        default_route="/auth/change-password" if is_pw_change_required else default_route,
+        must_change_password=is_pw_change_required,
+        message="Initial password change required before accessing other APIs." if is_pw_change_required else "Two-factor authentication successfully configured. Save your recovery codes in a secure location."
+    )
+
+@router.post("/mfa-verify", response_model=LoginResponse)
+def verify_mfa(payload: MFAVerifyRequest, request: Request, db: Session = Depends(get_db)):
+    """
+    Step 2 of Authentication:
+    Validates 6-digit Time-Based OTP (TOTP) code or single-use recovery code.
+    Enforces replay protection and brute-force lockout.
+    Issues JWT access & refresh tokens upon success, and logs audit entry.
+    """
+    email = payload.email.strip().lower()
+    lockout_err = check_account_lockout(email)
+    if lockout_err:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=lockout_err)
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        record_login_failure(email)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User account not found.")
+
+    if user.is_active is False:
+        record_login_failure(email)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is disabled. Please contact system administrator.")
+
+    clean_code = payload.mfa_code.replace(" ", "").strip()
+
+    # 1. Recovery code check
+    is_recovery = False
+    if verify_and_consume_recovery_code(user, clean_code):
+        is_recovery = True
+        record_login_success(email)
+        db.commit()
+    else:
+        # 2. Check demo code bypass: ONLY if workspace is 'sandbox'!
+        from app.workspace import resolve_workspace
+        ws = resolve_workspace(request)
+        is_demo_bypass = False
+        if clean_code == "123456" and ws == "sandbox":
+            is_demo_bypass = True
+
+        # 3. Verify TOTP RFC 6238 against user's secret
+        is_totp_valid = False
+        if not is_demo_bypass:
+            if not user.mfa_secret:
+                record_login_failure(email)
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Two-factor authentication is not enrolled. Please log in with password to enroll."
+                )
+
+            secret_plain = decrypt_mfa_secret(user.mfa_secret)
+            is_totp_valid = verify_totp_rfc6238(secret_plain, clean_code)
+
+            # Replay protection check
+            if is_totp_valid:
+                current_step = int(datetime.utcnow().timestamp() / 30)
+                if user.last_mfa_timestep == current_step:
+                    record_login_failure(email)
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="This verification code has already been used. Please wait for the next 30-second code from your authenticator app."
+                    )
+                user.last_mfa_timestep = current_step
+                db.commit()
+
+        if not is_recovery and not is_demo_bypass and not is_totp_valid:
+            record_login_failure(email)
+            err_msg = "Invalid two-factor authentication code. Please try again."
+            if ws == "sandbox":
+                err_msg = "Invalid TOTP code. For demonstration, please enter '123456'."
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=err_msg
+            )
+
+        record_login_success(email)
+
+    reg_code = user.region.code if user.region else "HQ"
+    default_route = get_default_route_for_role(user.role)
+    inst_name = user.institution.name if user.institution and user.role == "INSTITUTION_USER" else None
+    inst_pid = user.institution.permanent_id if user.institution and user.role == "INSTITUTION_USER" else None
+
+    from app.workspace import resolve_workspace
+    ws = resolve_workspace(request)
+    is_pw_change_required = bool(user.must_change_password)
+    access_token = create_access_token({
+        "sub": user.id,
+        "email": user.email,
+        "role": user.role,
+        "region_id": user.region_id,
+        "institution_id": user.institution_id,
+        "token_version": user.token_version or 0,
+        "must_change_password": is_pw_change_required,
+        "scope": "PASSWORD_CHANGE_REQUIRED" if is_pw_change_required else "FULL_ACCESS",
+        "type": "password_change_required" if is_pw_change_required else "access",
+        "ws": ws,
+    }, workspace=ws)
+    refresh_token = create_refresh_token({
+        "sub": user.id,
+        "role": user.role,
+        "token_version": user.token_version or 0,
+        "must_change_password": is_pw_change_required,
+        "ws": ws,
+    }, workspace=ws)
+
+    # Log to audit ledger
+    try:
+        ctx = RequestContext(user_id=user.id, role=user.role, region_id=user.region_id, institution_id=user.institution_id)
+        ScopedDAL(db, ctx).append_audit_entry(
+            action_type="MFA_RECOVERY_CODE_USED" if is_recovery else "USER_LOGIN_MFA_SUCCESS",
+            entity_type="User",
+            entity_id=user.id,
+            metadata={"email": user.email, "role": user.role, "mfa_used": True, "recovery": is_recovery}
         )
         db.commit()
     except Exception:
@@ -401,34 +690,116 @@ def verify_mfa(payload: MFAVerifyRequest, db: Session = Depends(get_db)):
         role=user.role,
         region_code=reg_code,
         institution_id=user.institution_id,
+        institution_name=inst_name,
+        institution_pid=inst_pid,
         access_token=access_token,
         refresh_token=refresh_token,
-        default_route=default_route,
-        message="Two-Factor Authentication verified. Access granted."
+        default_route="/auth/change-password" if is_pw_change_required else default_route,
+        must_change_password=is_pw_change_required,
+        message="Initial password change required before accessing other APIs." if is_pw_change_required else "Two-Factor Authentication verified. Access granted."
     )
+
+@router.post("/admin/reset-mfa/{user_id}")
+def admin_reset_mfa(
+    user_id: str,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db)
+):
+    """
+    Super Admin endpoint to reset a user's MFA settings.
+    Wipes mfa_secret, mfa_pending_secret, mfa_recovery_codes, and last_mfa_timestep.
+    Requires SUPER_ADMIN role.
+    Strictly recorded in the SHA-256 hash-chained audit ledger.
+    """
+    if ctx.role != "SUPER_ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Only Super Admin (Council Authority) can reset stakeholder MFA."
+        )
+
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User account not found.")
+
+    target_user.mfa_secret = None
+    target_user.mfa_pending_secret = None
+    target_user.mfa_recovery_codes = None
+    target_user.last_mfa_timestep = None
+    target_user.mfa_enabled = True # Keep enabled so user is prompted to enroll on next login
+    db.commit()
+
+    # Append to hash-chained audit ledger
+    ScopedDAL(db, ctx).append_audit_entry(
+        action_type="MFA_RESET_BY_ADMIN",
+        entity_type="User",
+        entity_id=target_user.id,
+        metadata={
+            "target_user_id": target_user.id,
+            "target_email": target_user.email,
+            "admin_user_id": ctx.user_id,
+            "reason": "Administrative MFA credentials reset request"
+        }
+    )
+    db.commit()
+
+    return {
+        "status": "SUCCESS",
+        "user_id": target_user.id,
+        "email": target_user.email,
+        "message": f"MFA credentials for {target_user.email} have been reset. User will be required to re-enroll upon next login."
+    }
 
 
 # -----------------------------------------------------------------------------
-# INSTITUTION SIGN-UP & EMAIL VERIFICATION (TASK 3)
+# INSTITUTION SIGN-UP & EMAIL VERIFICATION (DEFECT 3 FIX)
 # -----------------------------------------------------------------------------
 
 @router.post("/signup")
-def signup_institution(payload: SignUpRequest, db: Session = Depends(get_db)):
+def signup_institution(payload: SignUpRequest, request: Request, db: Session = Depends(get_db)):
     """
-    Real Institutional Sign-Up:
-    1. Validates unique email address.
-    2. Provisions new Institution record (status: PENDING_VERIFICATION).
-    3. Provisions new User account (role: INSTITUTION_USER, email_verified: False).
-    4. Generates cryptographic verification token and sends verification email via SMTP.
-    5. Records immutable audit entry in hash-chained ledger.
+    Real Institutional Sign-Up (DEFECT 3 Fixed):
+    - Never returns verification token in HTTP response.
+    - Response body does not reveal whether the email already exists.
+    - Token is stored only as SHA-256 hash with 24h expiry.
+    - Rate-limited per IP and per email.
     """
+    ip = get_client_ip(request)
     email = payload.email.strip().lower()
+
+    # Rate limiting (DEFECT 3 & 7)
+    if not check_rate_limit(f"signup_ip:{ip}", max_requests=10, window_seconds=900) or not check_rate_limit(f"signup_email:{email}", max_requests=5, window_seconds=900):
+        try:
+            ScopedDAL(db, RequestContext(user_id="anonymous", role="ANONYMOUS", ip_address=ip)).append_audit_entry(
+                action_type="SIGNUP_RATE_LIMITED",
+                entity_type="User",
+                entity_id="unknown",
+                metadata={"email": email, "ip": ip}
+            )
+            db.commit()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many sign-up requests. Please try again later."
+        )
+
     existing = db.query(User).filter(User.email == email).first()
     if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="An account with this email address is already registered."
-        )
+        time.sleep(0.05)
+        try:
+            ScopedDAL(db, RequestContext(user_id=existing.id, role=existing.role, ip_address=ip)).append_audit_entry(
+                action_type="USER_SIGNUP_DUPLICATE_ATTEMPT",
+                entity_type="User",
+                entity_id=existing.id,
+                metadata={"email": email, "ip": ip}
+            )
+            db.commit()
+        except Exception:
+            pass
+        return {
+            "status": "SUCCESS",
+            "message": "If this email address is eligible, verification instructions have been dispatched.",
+        }
 
     # Resolve Region
     reg = None
@@ -457,10 +828,10 @@ def signup_institution(payload: SignUpRequest, db: Session = Depends(get_db)):
     db.add(inst)
     db.flush()
 
-    # Generate cryptographic verification token
-    verification_token = secrets.token_urlsafe(32)
+    # Cryptographic verification token: raw token sent only via email, SHA-256 hash stored
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
-    # Create User
     user = User(
         email=email,
         password_hash=hash_password(payload.password),
@@ -470,7 +841,8 @@ def signup_institution(payload: SignUpRequest, db: Session = Depends(get_db)):
         institution_id=inst.id,
         mfa_enabled=False,
         email_verified=False,
-        verification_token=verification_token,
+        verification_token=token_hash,
+        verification_token_expires_at=datetime.utcnow() + timedelta(hours=24),
         whatsapp_phone=payload.whatsapp_phone,
         opt_in_whatsapp=payload.opt_in_whatsapp,
         preferred_language=payload.preferred_language or "en",
@@ -479,14 +851,13 @@ def signup_institution(payload: SignUpRequest, db: Session = Depends(get_db)):
     db.add(user)
     db.flush()
 
-    # Send verification email via real SMTP
     email_body = (
         f"Dear {user.full_name},\n\n"
         f"Welcome to the AICTE Regulatory Approval & Compliance Automation Platform.\n"
         f"Your institution registration for '{inst.name}' (PID: {inst.permanent_id}) has been created.\n\n"
         f"Please verify your email address to activate your account:\n"
-        f"Verification Token: {verification_token}\n\n"
-        f"Or click: http://127.0.0.1:3000/verify-email?token={verification_token}\n\n"
+        f"Verification Token: {raw_token}\n\n"
+        f"Or click: http://127.0.0.1:3000/verify-email?token={raw_token}\n\n"
         f"Regulatory Regards,\nAICTE Approval Bureau"
     )
     email_service.send_email(
@@ -496,8 +867,7 @@ def signup_institution(payload: SignUpRequest, db: Session = Depends(get_db)):
         override_quiet=True,
     )
 
-    # Log to audit ledger
-    ctx = RequestContext(user_id=user.id, role="INSTITUTION_USER", region_id=reg.id if reg else None, institution_id=inst.id)
+    ctx = RequestContext(user_id=user.id, role="INSTITUTION_USER", region_id=reg.id if reg else None, institution_id=inst.id, ip_address=ip)
     ScopedDAL(db, ctx).append_audit_entry(
         action_type="USER_SIGNUP",
         entity_type="User",
@@ -507,27 +877,51 @@ def signup_institution(payload: SignUpRequest, db: Session = Depends(get_db)):
             "institution_id": inst.id,
             "permanent_id": inst.permanent_id,
             "institution_name": inst.name,
+            "ip": ip,
         }
     )
     db.commit()
 
     return {
         "status": "SUCCESS",
-        "message": "Institution registered successfully. A verification link has been sent to your email.",
-        "email": user.email,
-        "institution_id": inst.id,
-        "permanent_id": inst.permanent_id,
-        "verification_token": verification_token,
+        "message": "If this email address is eligible, verification instructions have been dispatched.",
     }
 
+
 @router.post("/verify-email")
-def verify_email(payload: VerifyEmailRequest, db: Session = Depends(get_db)):
+def verify_email(payload: VerifyEmailRequest, request: Request, db: Session = Depends(get_db)):
     """
-    Validates cryptographic verification token, activates user and institution accounts.
+    Validates verification token (DEFECT 3 Fixed):
+    - Single use: invalidates token on use
+    - Token validated against SHA-256 hash
+    - Enforces 24h expiry
+    - Rate limits brute-force attempts
+    - Audits verification success and failure
     """
+    ip = get_client_ip(request)
+
+    if not check_rate_limit(f"verify_ip:{ip}", max_requests=10, window_seconds=900):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many verification attempts. Please try again later."
+        )
+
     clean_token = payload.token.strip()
-    user = db.query(User).filter(User.verification_token == clean_token).first()
-    if not user:
+    token_hash = hashlib.sha256(clean_token.encode("utf-8")).hexdigest()
+    user = db.query(User).filter(User.verification_token == token_hash).first()
+
+    now = datetime.utcnow()
+    if not user or (user.verification_token_expires_at and user.verification_token_expires_at < now):
+        try:
+            ScopedDAL(db, RequestContext(user_id="anonymous", role="ANONYMOUS", ip_address=ip)).append_audit_entry(
+                action_type="EMAIL_VERIFICATION_FAILED",
+                entity_type="User",
+                entity_id="unknown",
+                metadata={"ip": ip, "reason": "expired_or_invalid_token"}
+            )
+            db.commit()
+        except Exception:
+            pass
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid or expired verification token."
@@ -535,51 +929,72 @@ def verify_email(payload: VerifyEmailRequest, db: Session = Depends(get_db)):
 
     user.email_verified = True
     user.verification_token = None
+    user.verification_token_expires_at = None
 
     if user.institution:
         user.institution.status = "ACTIVE"
 
-    # Log audit entry
-    ctx = RequestContext(user_id=user.id, role=user.role, region_id=user.region_id, institution_id=user.institution_id)
+    ctx = RequestContext(user_id=user.id, role=user.role, region_id=user.region_id, institution_id=user.institution_id, ip_address=ip)
     ScopedDAL(db, ctx).append_audit_entry(
         action_type="EMAIL_VERIFIED",
         entity_type="User",
         entity_id=user.id,
-        metadata={"email": user.email, "institution_id": user.institution_id}
+        metadata={"email": user.email, "institution_id": user.institution_id, "ip": ip}
     )
     db.commit()
 
     return {
         "status": "SUCCESS",
         "message": "Email verified successfully. You may now log in to the portal.",
-        "email": user.email,
     }
 
 
 # -----------------------------------------------------------------------------
-# PASSWORD RESET FLOW (FORGOT / RESET) (TASK 3)
+# PASSWORD RESET FLOW (DEFECT 2 FIX)
 # -----------------------------------------------------------------------------
 
 @router.post("/forgot-password")
-def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
+def forgot_password(payload: ForgotPasswordRequest, request: Request, db: Session = Depends(get_db)):
     """
-    Initiates password reset:
-    Generates time-bound token (1 hour) and dispatches reset instructions via SMTP.
+    Initiates password reset (DEFECT 2 Fixed):
+    - Never returns token in response.
+    - Identical response body and timing for known and unknown accounts.
+    - Stored only as SHA-256 hash with 30-minute expiry.
+    - Rate-limited per IP and per email.
+    - Audited (requested, rate-limited).
     """
+    ip = get_client_ip(request)
     email = payload.email.strip().lower()
+
+    if not check_rate_limit(f"forgot_ip:{ip}", max_requests=5, window_seconds=900) or not check_rate_limit(f"forgot_email:{email}", max_requests=5, window_seconds=900):
+        try:
+            ScopedDAL(db, RequestContext(user_id="anonymous", role="ANONYMOUS", ip_address=ip)).append_audit_entry(
+                action_type="PASSWORD_RESET_RATE_LIMITED",
+                entity_type="User",
+                entity_id="unknown",
+                metadata={"email": email, "ip": ip}
+            )
+            db.commit()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many password reset requests. Please try again later."
+        )
+
     user = db.query(User).filter(User.email == email).first()
-    
-    reset_token = None
+
     if user:
-        reset_token = secrets.token_urlsafe(32)
-        user.reset_password_token = reset_token
-        user.reset_token_expires_at = datetime.utcnow() + timedelta(hours=1)
-        
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        user.reset_password_token = token_hash
+        user.reset_token_expires_at = datetime.utcnow() + timedelta(minutes=30)
+
         email_body = (
             f"Dear {user.full_name},\n\n"
             f"A password reset was requested for your AICTE Regulatory Portal account.\n"
-            f"Password Reset Token: {reset_token}\n\n"
-            f"This token is valid for 60 minutes.\n"
+            f"Password Reset Token: {raw_token}\n\n"
+            f"This token is valid for 30 minutes and can be used once.\n"
             f"If you did not request this, please contact AICTE security administrator immediately.\n\n"
             f"Regulatory Regards,\nAICTE Security Operations"
         )
@@ -590,51 +1005,193 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
             override_quiet=True,
         )
 
-        ctx = RequestContext(user_id=user.id, role=user.role, region_id=user.region_id, institution_id=user.institution_id)
+        ctx = RequestContext(user_id=user.id, role=user.role, region_id=user.region_id, institution_id=user.institution_id, ip_address=ip)
         ScopedDAL(db, ctx).append_audit_entry(
             action_type="PASSWORD_RESET_REQUESTED",
             entity_type="User",
             entity_id=user.id,
-            metadata={"email": user.email}
+            metadata={"email": user.email, "ip": ip}
         )
         db.commit()
+    else:
+        # Constant timing simulation: compute dummy hash + sleep
+        dummy_raw = secrets.token_urlsafe(32)
+        _ = hashlib.sha256(dummy_raw.encode("utf-8")).hexdigest()
+        time.sleep(0.05)
+        try:
+            ScopedDAL(db, RequestContext(user_id="anonymous", role="ANONYMOUS", ip_address=ip)).append_audit_entry(
+                action_type="PASSWORD_RESET_REQUESTED",
+                entity_type="User",
+                entity_id="unknown",
+                metadata={"email": email, "ip": ip, "notice": "account_not_found"}
+            )
+            db.commit()
+        except Exception:
+            pass
 
     return {
         "status": "SUCCESS",
         "message": "If the account exists, password reset instructions have been dispatched.",
-        "reset_token": reset_token, # included for dev/automated test verification
     }
 
+
 @router.post("/reset-password")
-def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)):
+def reset_password(payload: ResetPasswordRequest, request: Request, db: Session = Depends(get_db)):
     """
-    Completes password reset: validates token, expiry, updates PBKDF2 hash, and clears lockout.
+    Completes password reset (DEFECT 2 Fixed):
+    - Single use: token cleared immediately upon use.
+    - Validates token against SHA-256 hash.
+    - 30-minute expiry strictly enforced.
+    - Revokes existing refresh tokens and sessions (token_version incremented).
+    - Rate-limits brute-force token guesses.
+    - Audited (used, failed).
     """
-    clean_token = payload.token.strip()
-    user = db.query(User).filter(User.reset_password_token == clean_token).first()
-    if not user:
+    ip = get_client_ip(request)
+
+    if not check_rate_limit(f"reset_ip:{ip}", max_requests=10, window_seconds=900):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or unrecognized password reset token."
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many password reset attempts. Please try again later."
         )
 
-    if user.reset_token_expires_at and user.reset_token_expires_at < datetime.utcnow():
+    clean_token = payload.token.strip()
+    token_hash = hashlib.sha256(clean_token.encode("utf-8")).hexdigest()
+    user = db.query(User).filter(User.reset_password_token == token_hash).first()
+
+    now = datetime.utcnow()
+    if not user or (user.reset_token_expires_at and user.reset_token_expires_at < now):
+        try:
+            ScopedDAL(db, RequestContext(user_id="anonymous", role="ANONYMOUS", ip_address=ip)).append_audit_entry(
+                action_type="PASSWORD_RESET_FAILED",
+                entity_type="User",
+                entity_id="unknown",
+                metadata={"ip": ip, "reason": "expired_or_invalid_token"}
+            )
+            db.commit()
+        except Exception:
+            pass
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password reset token has expired. Please request a fresh reset link."
+            detail="Invalid or expired password reset token."
+        )
+
+    # Validate statutory password policy (DEFECT 5)
+    is_valid_pw, pw_err = validate_password_policy(payload.new_password, user.email, user.password_hash)
+    if not is_valid_pw:
+        try:
+            ScopedDAL(db, RequestContext(user_id=user.id, role=user.role, ip_address=ip)).append_audit_entry(
+                action_type="PASSWORD_RESET_FAILED",
+                entity_type="User",
+                entity_id=user.id,
+                metadata={"ip": ip, "reason": pw_err}
+            )
+            db.commit()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=pw_err
         )
 
     # Update password hash
     user.password_hash = hash_password(payload.new_password)
+    # Single use: invalidate token
     user.reset_password_token = None
     user.reset_token_expires_at = None
+    # Revoke all existing sessions and refresh tokens
+    user.token_version = (user.token_version or 0) + 1
+    user.must_change_password = False
 
     # Clear any lockout
     record_login_success(user.email)
 
-    ctx = RequestContext(user_id=user.id, role=user.role, region_id=user.region_id, institution_id=user.institution_id)
+    ctx = RequestContext(user_id=user.id, role=user.role, region_id=user.region_id, institution_id=user.institution_id, ip_address=ip)
     ScopedDAL(db, ctx).append_audit_entry(
-        action_type="PASSWORD_RESET_SUCCESS",
+        action_type="PASSWORD_RESET_USED",
+        entity_type="User",
+        entity_id=user.id,
+        metadata={"email": user.email, "ip": ip}
+    )
+    db.commit()
+
+    return {
+        "status": "SUCCESS",
+        "message": "Password updated successfully. Please log in with your new credentials.",
+    }
+
+
+# -----------------------------------------------------------------------------
+# FORCED PASSWORD CHANGE (DEFECT 5 FIX)
+# -----------------------------------------------------------------------------
+
+@router.post("/change-password")
+def change_password(
+    payload: ChangePasswordRequest,
+    request: Request,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+):
+    """
+    Forced first-login password change & general password rotation (DEFECT 5):
+    - Enforces min 12 characters, breach-list check, not equal to email.
+    - Requires new password to differ from initial / current password.
+    - Revokes existing sessions and clears must_change_password flag.
+    - Writes immutable audit trail entry.
+    """
+    user = db.query(User).filter(User.id == ctx.user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User account not found."
+        )
+
+    if payload.old_password and not verify_password(payload.old_password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password verification failed."
+        )
+
+    is_valid_pw, pw_err = validate_password_policy(payload.new_password, user.email, user.password_hash)
+    if not is_valid_pw:
+        try:
+            ScopedDAL(db, ctx).append_audit_entry(
+                action_type="PASSWORD_CHANGE_FAILED",
+                entity_type="User",
+                entity_id=user.id,
+                metadata={"email": user.email, "reason": pw_err}
+            )
+            db.commit()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=pw_err
+        )
+
+    # Update password and clear must_change_password
+    user.password_hash = hash_password(payload.new_password)
+    user.must_change_password = False
+    # Revoke previous sessions
+    user.token_version = (user.token_version or 0) + 1
+    record_login_success(user.email)
+
+    # Issue fresh unrestricted tokens
+    new_access = create_access_token({
+        "sub": user.id,
+        "email": user.email,
+        "role": user.role,
+        "region_id": user.region_id,
+        "institution_id": user.institution_id,
+        "token_version": user.token_version,
+    })
+    new_refresh = create_refresh_token({
+        "sub": user.id,
+        "role": user.role,
+        "token_version": user.token_version,
+    })
+
+    ScopedDAL(db, ctx).append_audit_entry(
+        action_type="PASSWORD_CHANGED",
         entity_type="User",
         entity_id=user.id,
         metadata={"email": user.email}
@@ -643,7 +1200,9 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
 
     return {
         "status": "SUCCESS",
-        "message": "Password updated successfully. Please log in with your new credentials.",
+        "message": "Password changed successfully.",
+        "access_token": new_access,
+        "refresh_token": new_refresh,
     }
 
 
@@ -655,6 +1214,7 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
 def refresh_token(payload: RefreshTokenRequest, db: Session = Depends(get_db)):
     """
     Validates cryptographic refresh token and issues fresh access and refresh token pair.
+    Revokes tokens if password has been changed (token_version mismatch).
     """
     try:
         decoded = decode_token(payload.refresh_token.strip(), require_role=False)
@@ -678,14 +1238,25 @@ def refresh_token(payload: RefreshTokenRequest, db: Session = Depends(get_db)):
             detail="User account associated with refresh token is invalid or inactive."
         )
 
+    if decoded.get("token_version", 0) != (user.token_version or 0):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session has expired or was revoked due to password change. Please log in again."
+        )
+
     new_access = create_access_token({
         "sub": user.id,
         "email": user.email,
         "role": user.role,
         "region_id": user.region_id,
         "institution_id": user.institution_id,
+        "token_version": user.token_version or 0,
     })
-    new_refresh = create_refresh_token({"sub": user.id, "role": user.role})
+    new_refresh = create_refresh_token({
+        "sub": user.id,
+        "role": user.role,
+        "token_version": user.token_version or 0,
+    })
 
     return {
         "access_token": new_access,
@@ -809,16 +1380,18 @@ def admin_create_officer(
 
 @router.post("/demo-token/{role}")
 @router.post("/demo-switch-token/{role}")
-def issue_demo_token(role: str, db: Session = Depends(get_db)):
+def issue_demo_token(role: str, request: Request, db: Session = Depends(get_db)):
     """
     Demo Shortcut (Labeled: Demo Only):
     Generates a cryptographically signed JWT for the specified stakeholder persona.
-    Gated behind EVALUATOR_MODE / DEMO_MODE flag.
+    Gated behind Sandbox workspace (returns 404 in Live).
     """
-    if not settings.DEMO_MODE:
+    from app.workspace import resolve_workspace
+    ws = resolve_workspace(request)
+    if ws != "sandbox":
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Role switching and demo tokens are disabled in production mode (DEMO_MODE=False)."
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not Found: Demo switch tokens are only available in Sandbox workspace."
         )
 
     role_upper = role.strip().upper()
@@ -838,6 +1411,18 @@ def issue_demo_token(role: str, db: Session = Depends(get_db)):
         inst_id = db.query(Institution).first().id if role_upper == "INSTITUTION_USER" else None
         reg_code = "SWRO" if reg_id else "HQ"
 
+    inst_name = None
+    inst_pid = None
+    if role_upper == "INSTITUTION_USER":
+        if user and user.institution:
+            inst_name = user.institution.name
+            inst_pid = user.institution.permanent_id
+        else:
+            first_inst = db.query(Institution).first()
+            if first_inst:
+                inst_name = first_inst.name
+                inst_pid = first_inst.permanent_id
+
     access_token = create_access_token({
         "sub": user_id,
         "email": email,
@@ -845,14 +1430,18 @@ def issue_demo_token(role: str, db: Session = Depends(get_db)):
         "region_id": reg_id,
         "institution_id": inst_id,
         "demo_shortcut": True,
-    })
+        "ws": "sandbox",
+    }, workspace="sandbox")
 
     return {
         "access_token": access_token,
         "token_type": "bearer",
         "role": role_upper,
+        "workspace": "sandbox",
         "user_id": user_id,
         "region_code": reg_code,
+        "institution_name": inst_name,
+        "institution_pid": inst_pid,
         "shortcut_status": "Demo Only",
         "notice": "DEMO ONLY: Simulated evaluation token. Production mandates hardware TOTP MFA."
     }

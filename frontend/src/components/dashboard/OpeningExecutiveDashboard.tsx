@@ -43,7 +43,10 @@ export const OpeningExecutiveDashboard: React.FC = () => {
     virtualDate,
     virtualDaysOffset,
     setActiveNavTab,
+    evaluatorMode,
+    isDemoMode,
   } = useApp();
+  const isEvalActive = evaluatorMode || isDemoMode;
 
   const [selectedPipelineFilter, setSelectedPipelineFilter] = useState<string>('ALL');
   const [showScenarioModal, setShowScenarioModal] = useState<boolean>(false);
@@ -135,10 +138,10 @@ export const OpeningExecutiveDashboard: React.FC = () => {
           </div>
         </div>
 
-        {/* Demo Clock & Active User Strip */}
+        {/* Clock & Active User Strip */}
         <div className="flex items-center gap-3">
           <div className="text-right">
-            <div className="text-[10px] text-ink-muted uppercase font-bold tracking-wider">Active Evaluator</div>
+            <div className="text-[10px] text-ink-muted uppercase font-bold tracking-wider">{isEvalActive ? 'Active Evaluator' : 'Active Profile'}</div>
             <div className="text-xs font-bold text-ink-strong">{currentUser.name}</div>
             <span className="text-[10px] bg-slate-100 text-ink px-1.5 py-0.2 rounded font-medium">
               {currentUser.roleLabel}
@@ -148,18 +151,20 @@ export const OpeningExecutiveDashboard: React.FC = () => {
           <div className="h-8 w-px bg-slate-200 hidden sm:block" />
 
           <div className="text-right">
-            <div className="text-[10px] text-ink-muted uppercase font-bold tracking-wider">Simulation Clock</div>
+            <div className="text-[10px] text-ink-muted uppercase font-bold tracking-wider">{isEvalActive ? 'Simulation Clock' : 'System Date'}</div>
             <div className="text-xs font-mono font-bold text-ink-strong">
               {virtualDate.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}
             </div>
-            {virtualDaysOffset > 0 ? (
-              <span className="text-[10px] font-bold text-roseState-700 bg-roseState-100 px-1.5 py-0.2 rounded">
-                +{virtualDaysOffset}d Advanced
-              </span>
-            ) : (
-              <span className="text-[10px] font-bold text-mint-700 bg-mint-100 px-1.5 py-0.2 rounded">
-                Current Time
-              </span>
+            {isEvalActive && (
+              virtualDaysOffset > 0 ? (
+                <span className="text-[10px] font-bold text-roseState-700 bg-roseState-100 px-1.5 py-0.2 rounded">
+                  +{virtualDaysOffset}d Advanced
+                </span>
+              ) : (
+                <span className="text-[10px] font-bold text-mint-700 bg-mint-100 px-1.5 py-0.2 rounded">
+                  Current Time
+                </span>
+              )
             )}
           </div>
 
@@ -189,32 +194,34 @@ export const OpeningExecutiveDashboard: React.FC = () => {
         </div>
       </div>
 
-      {/* EVALUATOR SCRIPTED SCENARIO QUICK-LAUNCH BANNER */}
-      <div className="bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 rounded-2xl p-5 text-white shadow-card border border-indigo-900 flex flex-wrap items-center justify-between gap-4">
-        <div className="space-y-1 max-w-2xl">
-          <div className="flex items-center gap-2">
-            <span className="bg-amber-400 text-slate-950 text-[10px] font-black px-2 py-0.5 rounded uppercase tracking-wider">
-              Evaluator Demo Mode
-            </span>
-            <h2 className="text-sm font-bold text-white tracking-tight">
-              One-Click Scripted Scenario (8-Stage End-to-End Approval & Escalation Lifecycle)
-            </h2>
+      {/* EVALUATOR SCRIPTED SCENARIO QUICK-LAUNCH BANNER (ONLY IN EVALUATOR MODE) */}
+      {isEvalActive && (
+        <div className="bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 rounded-2xl p-5 text-white shadow-card border border-indigo-900 flex flex-wrap items-center justify-between gap-4">
+          <div className="space-y-1 max-w-2xl">
+            <div className="flex items-center gap-2">
+              <span className="bg-amber-400 text-slate-950 text-[10px] font-black px-2 py-0.5 rounded uppercase tracking-wider">
+                Evaluator Demo Mode
+              </span>
+              <h2 className="text-sm font-bold text-white tracking-tight">
+                One-Click Scripted Scenario (8-Stage End-to-End Approval & Escalation Lifecycle)
+              </h2>
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Execute the full regulatory approval pipeline in sequence: <strong className="text-amber-200">APH Ingestion</strong> → <strong className="text-amber-200">Versioned AST Rules</strong> → <strong className="text-amber-200">Table 2.3 Auto-Route</strong> → <strong className="text-amber-200">EVC Panel</strong> → <strong className="text-amber-200">Time Travel Jump</strong> → <strong className="text-amber-200">SLA Breach Cascade</strong> → <strong className="text-amber-200">Document Hash Anomaly</strong> → <strong className="text-amber-200">Cryptographic SHA-256 Chain Proof</strong>.
+            </p>
           </div>
-          <p className="text-xs text-slate-300 leading-relaxed">
-            Execute the full regulatory approval pipeline in sequence: <strong className="text-amber-200">APH Ingestion</strong> → <strong className="text-amber-200">Versioned AST Rules</strong> → <strong className="text-amber-200">Table 2.3 Auto-Route</strong> → <strong className="text-amber-200">EVC Panel</strong> → <strong className="text-amber-200">Time Travel Jump</strong> → <strong className="text-amber-200">SLA Breach Cascade</strong> → <strong className="text-amber-200">Document Hash Anomaly</strong> → <strong className="text-amber-200">Cryptographic SHA-256 Chain Proof</strong>.
-          </p>
-        </div>
 
-        <div className="flex items-center gap-3">
-          <button
-            onClick={() => setShowScenarioModal(true)}
-            className="px-5 py-2.5 bg-gradient-to-r from-amber-400 via-amber-500 to-rose-500 hover:from-amber-500 hover:to-rose-600 text-slate-950 font-black rounded-xl text-xs shadow-lg hover:shadow-xl transition-all flex items-center gap-2"
-          >
-            <Zap className="w-4 h-4 fill-slate-950" />
-            <span>⚡ Launch 8-Step Scenario & Time Travel</span>
-          </button>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setShowScenarioModal(true)}
+              className="px-5 py-2.5 bg-gradient-to-r from-amber-400 via-amber-500 to-rose-500 hover:from-amber-500 hover:to-rose-600 text-slate-950 font-black rounded-xl text-xs shadow-lg hover:shadow-xl transition-all flex items-center gap-2"
+            >
+              <Zap className="w-4 h-4 fill-slate-950" />
+              <span>⚡ Launch 8-Step Scenario & Time Travel</span>
+            </button>
+          </div>
         </div>
-      </div>
+      )}
 
       {/* OPERATIONAL IMPACT & ACADEMIC RISK METRICS CARD */}
       <div className="bg-white rounded-2xl border border-ink-line p-5 shadow-soft space-y-4">

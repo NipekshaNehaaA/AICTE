@@ -5,7 +5,12 @@ import os
 import secrets
 import struct
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
+import io
+import json
+import pyotp
+import qrcode
+from cryptography.fernet import Fernet
 from fastapi import Request, Header, HTTPException, status
 import jwt
 from app.config import settings
@@ -30,16 +35,25 @@ def verify_password(plain_password: str, stored_hash: str) -> bool:
     except Exception:
         return False
 
-def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None, workspace: Optional[str] = None) -> str:
+    from app.workspace import current_workspace_var
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire, "type": "access"})
+    token_type = to_encode.get("type", "access")
+    ws = to_encode.get("ws") or workspace or current_workspace_var.get() or "live"
+    to_encode.update({"exp": expire, "type": token_type, "ws": ws})
+    if "token_version" not in to_encode:
+        to_encode["token_version"] = 0
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
-def create_refresh_token(data: Dict[str, Any]) -> str:
+def create_refresh_token(data: Dict[str, Any], workspace: Optional[str] = None) -> str:
+    from app.workspace import current_workspace_var
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "type": "refresh"})
+    ws = to_encode.get("ws") or workspace or current_workspace_var.get() or "live"
+    to_encode.update({"exp": expire, "type": "refresh", "ws": ws})
+    if "token_version" not in to_encode:
+        to_encode["token_version"] = 0
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 def decode_token(token: str, require_role: bool = True) -> Dict[str, Any]:
@@ -71,23 +85,99 @@ def decode_token(token: str, require_role: bool = True) -> Dict[str, Any]:
     except jwt.PyJWTError as e:
         raise ValueError(f"Invalid token: {str(e)}")
 
+def get_mfa_cipher() -> Fernet:
+    """Derives a deterministic 32-byte Fernet key for symmetric MFA secret encryption at rest."""
+    key_env = settings.MFA_ENCRYPTION_KEY
+    if key_env:
+        key_bytes = hashlib.sha256(key_env.encode()).digest()
+    else:
+        key_bytes = hashlib.sha256((settings.SECRET_KEY + "_mfa_encryption_salt").encode()).digest()
+    fernet_key = base64.urlsafe_b64encode(key_bytes)
+    return Fernet(fernet_key)
+
+def encrypt_mfa_secret(secret: str) -> str:
+    """Encrypts a plaintext base32 TOTP secret for storage at rest."""
+    if not secret:
+        return secret
+    cipher = get_mfa_cipher()
+    return cipher.encrypt(secret.strip().encode()).decode()
+
+def decrypt_mfa_secret(stored_secret: Optional[str]) -> Optional[str]:
+    """Decrypts a stored TOTP secret, falling back gracefully if already plaintext."""
+    if not stored_secret:
+        return None
+    try:
+        cipher = get_mfa_cipher()
+        return cipher.decrypt(stored_secret.encode()).decode()
+    except Exception:
+        # Fallback if stored in plaintext (e.g. from existing test fixtures)
+        return stored_secret
+
+def generate_totp_secret() -> str:
+    """Generates a standard RFC 6238 base32 secret."""
+    return pyotp.random_base32()
+
+def generate_provisioning_uri(email: str, secret: str, issuer: str = "AICTE Approval Portal") -> str:
+    """Generates an otpauth:// provisioning URI for authenticator apps."""
+    totp = pyotp.TOTP(secret)
+    return totp.provisioning_uri(name=email, issuer_name=issuer)
+
+def generate_qr_code_data_uri(provisioning_uri: str) -> str:
+    """Generates server-side QR code data URI. Never logs the underlying secret."""
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=6,
+        border=2,
+    )
+    qr.add_data(provisioning_uri)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
+
+def generate_recovery_codes(count: int = 8) -> List[str]:
+    """Generates formatted single-use alphanumeric recovery codes (e.g. ABCD-1234)."""
+    codes = []
+    for _ in range(count):
+        part1 = secrets.token_hex(2).upper()
+        part2 = secrets.token_hex(2).upper()
+        codes.append(f"{part1}-{part2}")
+    return codes
+
+def hash_recovery_code(user_id: str, code: str) -> str:
+    """Hashes a recovery code with user_id salt."""
+    clean = code.strip().replace("-", "").replace(" ", "").upper()
+    return hashlib.sha256(f"{user_id}:{clean}".encode()).hexdigest()
+
+def verify_and_consume_recovery_code(user, raw_code: str) -> bool:
+    """Validates recovery code and removes it (single-use guarantee)."""
+    if not user.mfa_recovery_codes:
+        return False
+    try:
+        stored_hashes = json.loads(user.mfa_recovery_codes)
+        if not isinstance(stored_hashes, list):
+            return False
+        candidate_hash = hash_recovery_code(user.id, raw_code)
+        if candidate_hash in stored_hashes:
+            stored_hashes.remove(candidate_hash)
+            user.mfa_recovery_codes = json.dumps(stored_hashes)
+            return True
+    except Exception:
+        pass
+    return False
+
 def verify_totp_rfc6238(secret: str, code: str, window: int = 1) -> bool:
     """Standard RFC 6238 Time-based One-Time Password verification (30s window)."""
-    try:
-        clean_secret = secret.strip().upper()
-        missing_padding = len(clean_secret) % 8
-        if missing_padding:
-            clean_secret += "=" * (8 - missing_padding)
-        key = base64.b32decode(clean_secret, casefold=True)
-        current_step = int(datetime.utcnow().timestamp() / 30)
-        for offset in range(-window, window + 1):
-            time_bytes = struct.pack(">Q", current_step + offset)
-            h = hmac.new(key, time_bytes, hashlib.sha1).digest()
-            o = h[19] & 0x0F
-            token_int = (struct.unpack(">I", h[o : o + 4])[0] & 0x7FFFFFFF) % 1000000
-            if f"{token_int:06d}" == code:
-                return True
+    if not secret or not code:
         return False
+    try:
+        clean_secret = secret.strip().replace(" ", "").upper()
+        clean_code = str(code).strip().replace(" ", "")
+        totp = pyotp.TOTP(clean_secret)
+        return bool(totp.verify(clean_code, valid_window=window))
     except Exception:
         return False
 
@@ -101,10 +191,14 @@ def verify_mfa_code(user_secret: Optional[str], code: str) -> bool:
     if clean_code == "123456":
         return bool(settings.DEMO_MODE)
 
-    if not user_secret or len(clean_code) != 6:
+    if not user_secret:
         return False
 
-    return verify_totp_rfc6238(user_secret, clean_code)
+    decrypted = decrypt_mfa_secret(user_secret)
+    if not decrypted or len(clean_code) != 6:
+        return False
+
+    return verify_totp_rfc6238(decrypted, clean_code)
 
 # Brute-force in-memory attempt tracker for fast dev evaluation
 _login_attempts: Dict[str, Dict[str, Any]] = {}
@@ -135,6 +229,53 @@ def record_login_failure(email: str) -> bool:
 def record_login_success(email: str):
     """Resets failed login tracker upon successful authentication."""
     _login_attempts.pop(email, None)
+
+_rate_limits: Dict[str, List[float]] = {}
+
+def check_rate_limit(key: str, max_requests: int = 5, window_seconds: int = 900) -> bool:
+    """Sliding-window rate limiter per key (IP, email, or endpoint). Returns True if allowed, False if exceeded."""
+    import time
+    now = time.time()
+    timestamps = _rate_limits.setdefault(key, [])
+    _rate_limits[key] = [t for t in timestamps if now - t < window_seconds]
+    if len(_rate_limits[key]) >= max_requests:
+        return False
+    _rate_limits[key].append(now)
+    return True
+
+def clear_rate_limits():
+    """Resets all in-memory rate limits and login attempts."""
+    _rate_limits.clear()
+    _login_attempts.clear()
+
+COMMON_BREACH_PASSWORDS = {
+    "password", "password123", "password1234", "password12345", "password@123456",
+    "password123456", "password@123", "p@ssword1234", "p@ssword12345",
+    "123456789012", "1234567890123", "admin1234567", "administrator",
+    "administrator123", "welcome12345", "welcome@12345", "aicte1234567",
+    "aicte@123456", "demopassword", "demopassword@123", "admininitialpass@2026",
+    "changeme1234", "qwertyuiop12", "qwertyuiop123", "letmein123456",
+    "iloveyou12345", "sunshine12345", "princess12345", "football12345",
+}
+
+def validate_password_policy(password: str, email: str, current_password_hash: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+    """
+    Enforces statutory password policy:
+    - Min 12 chars
+    - Breach-list check
+    - Not equal to email
+    - Must differ from initial / current password
+    """
+    clean_pw = password.strip()
+    if len(clean_pw) < 12:
+        return False, "Password must be at least 12 characters in length."
+    if current_password_hash and verify_password(clean_pw, current_password_hash):
+        return False, "New password must differ from your current or initial password."
+    if clean_pw.lower() == email.strip().lower():
+        return False, "Password cannot be equal to your email address."
+    if clean_pw.lower() in COMMON_BREACH_PASSWORDS:
+        return False, "The chosen password is on a known breach list of common passwords. Please choose a stronger password."
+    return True, None
 
 def _clean_header_val(val: Any) -> Optional[str]:
     if val is None or not isinstance(val, str):
@@ -197,12 +338,34 @@ def get_request_context(
     jwt_role = payload.get("role")
     jwt_region_id = payload.get("region_id")
     jwt_institution_id = payload.get("institution_id")
+    jwt_ws = payload.get("ws", "live")
 
     if not jwt_user_id or not jwt_role:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token claims: user ID and role are required.",
         )
+
+    # Check X-Workspace header cross-contamination if provided
+    if request is not None and hasattr(request, "headers"):
+        header_ws = request.headers.get("x-workspace")
+        if header_ws and header_ws.strip().lower() != jwt_ws.lower():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Workspace Violation: Provided token is bound to '{jwt_ws}' workspace and cannot access '{header_ws}' workspace.",
+            )
+
+    from app.workspace import current_workspace_var
+    current_workspace_var.set(jwt_ws)
+
+    # DEFECT 5 guard: restricted password change token can ONLY access /auth/change-password
+    if payload.get("must_change_password") or payload.get("scope") == "PASSWORD_CHANGE_REQUIRED" or payload.get("type") == "password_change_required":
+        path = str(request.url.path) if request and hasattr(request, "url") else ""
+        if not (path.endswith("/change-password") or path.endswith("/auth/change-password")):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Password change required before accessing other APIs."
+            )
 
     # Reject forged header mismatch
     if role_header and role_header != jwt_role:
@@ -226,5 +389,6 @@ def get_request_context(
         region_id=jwt_region_id,
         institution_id=jwt_institution_id,
         ip_address=ip,
+        workspace=jwt_ws,
     )
 

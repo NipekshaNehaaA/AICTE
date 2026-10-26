@@ -51,6 +51,7 @@ class TwilioWhatsAppAdapter:
         message_body: str,
         user_opted_in: bool = True,
         override_sandbox_label: bool = False,
+        workspace: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Dispatches a WhatsApp message via Twilio Sandbox or falls back to SIMULATED.
@@ -58,12 +59,35 @@ class TwilioWhatsAppAdapter:
         """
         now_iso = datetime.utcnow().isoformat()
 
+        from app.workspace import current_workspace_var, get_sandbox_override
+        ws = (workspace or current_workspace_var.get() or "live").lower()
+        sandbox_note = None
+
+        target_phone = to_phone
+        if ws == "sandbox":
+            override_info = get_sandbox_override()
+            override_phone = override_info.get("override_whatsapp")
+            if override_phone:
+                target_phone = override_phone
+                sandbox_note = f"Sandbox: sent to {override_phone}"
+            else:
+                return {
+                    "status": "SANDBOX_SKIPPED_NO_OVERRIDE",
+                    "channel": "WHATSAPP_SANDBOX",
+                    "recipient": to_phone,
+                    "sandbox_note": "Sandbox: skipped synthetic recipient (no override configured)",
+                    "receipt_id": None,
+                    "reason": "Sandbox mode: messages are only dispatched to an evaluator override phone number.",
+                    "delivered_at": None,
+                }
+
         if not user_opted_in:
             return {
                 "status": "SKIPPED_NOT_OPTED_IN",
                 "channel": "WHATSAPP_SANDBOX",
                 "label": "sandbox",
-                "recipient": to_phone,
+                "recipient": target_phone,
+                "sandbox_note": sandbox_note,
                 "receipt_id": None,
                 "reason": "Recipient has not opted in to statutory WhatsApp notifications.",
                 "delivered_at": None,
@@ -81,7 +105,8 @@ class TwilioWhatsAppAdapter:
                 "channel": "WHATSAPP_SIMULATED",
                 "label": "SIMULATED",
                 "receipt_id": sim_id,
-                "recipient": to_phone,
+                "recipient": target_phone,
+                "sandbox_note": sandbox_note,
                 "message": full_body,
                 "delivered_at": now_iso,
                 "note": "Twilio credentials absent; delivered via simulated sandbox adapter.",
@@ -141,3 +166,4 @@ class TwilioWhatsAppAdapter:
         }
 
 whatsapp_adapter = TwilioWhatsAppAdapter()
+twilio_whatsapp_client = whatsapp_adapter

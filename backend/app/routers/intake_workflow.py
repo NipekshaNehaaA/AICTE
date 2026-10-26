@@ -13,12 +13,17 @@ Endpoints:
 """
 
 import uuid
+import secrets
+import hashlib
+import hmac
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from app.database import get_db
+from app.workspace import resolve_workspace
+from app.email_service import email_service
 from app.models import (
     Application,
     ApplicationStage,
@@ -469,7 +474,9 @@ def get_application_details(
             "mime_type": getattr(d, "mime_type", "application/pdf"),
             "status": getattr(d, "status", "ACTIVE"),
             "expiry_date": d.expiry_date.strftime("%Y-%m-%d") if getattr(d, "expiry_date", None) else None,
-            "download_url": f"/api/v1/documents/{d.id}/download",
+            "download_url": f"/api/v1/compliance/documents/{d.id}/download",
+            "preview_url": f"/api/v1/compliance/documents/{d.id}/preview",
+            "access_control_url": f"/api/v1/compliance/documents/{d.id}/access-control",
             "uploaded_at": d.created_at.strftime("%Y-%m-%d %H:%M") if getattr(d, "created_at", None) else None,
         }
         documents_data.append(doc_dict)
@@ -613,8 +620,11 @@ def get_application_details(
 # Workflow Progression & Revert Loop
 # -----------------------------------------------------------------------------
 @router.post("/workflow/{application_id}/advance")
+@router.post("/applications/{application_id}/advance")
+@router.post("/applications/workflow/{application_id}/advance")
 def advance_stage(
     application_id: str,
+    target_stage: Optional[str] = None,
     remarks: str = "Stage completed by authorized official.",
     ctx: RequestContext = Depends(get_request_context),
     db: Session = Depends(get_db),
@@ -628,7 +638,7 @@ def advance_stage(
     if not app:
         raise HTTPException(status_code=404, detail="Application not found.")
 
-    next_stg = APHRulesEngine.get_next_stage(app.pipeline_type, app.current_stage)
+    next_stg = target_stage or APHRulesEngine.get_next_stage(app.pipeline_type, app.current_stage)
     if not next_stg:
         next_stg = "APPROVED"
 
@@ -1000,26 +1010,207 @@ def verify_re_scrutiny(
         "current_stage": app.current_stage,
     }
 
+class TrackingOTPRequest(BaseModel):
+    tracking_id: str
+
+_public_tracking_otp_store: Dict[str, Dict[str, Any]] = {}
+_public_otp_ip_rate_limits: Dict[str, List[float]] = {}
+_public_otp_tracking_id_rate_limits: Dict[str, List[float]] = {}
+
+def mask_email(email_str: str) -> str:
+    if not email_str or "@" not in email_str:
+        return "***"
+    local, domain = email_str.split("@", 1)
+    if len(local) <= 2:
+        masked_local = local[0] + "***"
+    else:
+        masked_local = local[0] + "***" + local[-1]
+    return f"{masked_local}@{domain}"
+
+@router.post("/workflow/public/request-otp")
+def request_tracking_otp(
+    payload: TrackingOTPRequest,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Public Status Tracking: Sends dynamic one-time verification code to the institution's registered email address.
+    - Rate-limited per IP (5 requests / 10 minutes) and per tracking ID (3 requests / 10 minutes).
+    - Stores only a SHA-256 hash at rest.
+    - 10-minute expiry window.
+    - 5 verification attempts allowed.
+    - Demo code hint exposed ONLY if EVALUATOR_MODE is active.
+    """
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    now_ts = datetime.utcnow().timestamp()
+
+    # Rate limiting: IP level
+    ip_ts = _public_otp_ip_rate_limits.setdefault(client_ip, [])
+    ip_ts = [t for t in ip_ts if now_ts - t < 600.0]
+    _public_otp_ip_rate_limits[client_ip] = ip_ts
+    if len(ip_ts) >= 5:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded for this IP. Please wait 10 minutes before requesting another code."
+        )
+
+    clean_id = payload.tracking_id.strip()
+
+    # Rate limiting: Tracking ID level
+    tid_ts = _public_otp_tracking_id_rate_limits.setdefault(clean_id, [])
+    tid_ts = [t for t in tid_ts if now_ts - t < 600.0]
+    _public_otp_tracking_id_rate_limits[clean_id] = tid_ts
+    if len(tid_ts) >= 3:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded for this tracking ID. Please wait 10 minutes before requesting another code."
+        )
+
+    # Locate application via ScopedDAL
+    dal = ScopedDAL(db, RequestContext(role="PUBLIC"))
+    app = dal.get_public_application_status(clean_id)
+    if not app:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Application record '{clean_id}' not found."
+        )
+
+    # Resolve institution's registered email
+    inst = app.institution
+    registered_email = None
+    if inst:
+        inst_user = db.query(User).filter(User.institution_id == inst.id).first()
+        if inst_user and inst_user.email:
+            registered_email = inst_user.email
+        elif inst.permanent_id:
+            registered_email = f"principal.{inst.permanent_id.replace('-', '')}@fictional-aicte.edu.in"
+    if not registered_email:
+        registered_email = "institution.applicant@aicte-india.org"
+
+    # Generate 6-digit OTP and store only SHA-256 hash
+    otp = f"{secrets.randbelow(900000) + 100000}"
+    salt = settings.SECRET_KEY[:16]
+    otp_hash = hashlib.sha256(f"{clean_id}:{otp}:{salt}".encode()).hexdigest()
+
+    _public_tracking_otp_store[clean_id] = {
+        "otp_hash": otp_hash,
+        "expires_at": datetime.utcnow() + timedelta(minutes=10),
+        "attempts_left": 5,
+        "email": registered_email,
+        "masked_email": mask_email(registered_email),
+    }
+    ip_ts.append(now_ts)
+    tid_ts.append(now_ts)
+
+    # Dispatch via real email service
+    email_service.send_email(
+        to_email=registered_email,
+        subject=f"AICTE Application Tracking OTP - {app.application_no}",
+        text_content=(
+            f"Dear Stakeholder,\n\n"
+            f"Your one-time verification code to track AICTE application {app.application_no} is:\n\n"
+            f"   {otp}\n\n"
+            f"This code will expire in 10 minutes. Maximum 5 verification attempts permitted.\n\n"
+            f"Statutory Approval Bureau,\nAll India Council for Technical Education"
+        ),
+        override_quiet=True
+    )
+
+    response_data = {
+        "status": "SUCCESS",
+        "message": f"Verification code dispatched to institution's registered email ({mask_email(registered_email)}).",
+        "masked_email": mask_email(registered_email),
+        "expires_in_seconds": 600,
+    }
+    ws = resolve_workspace(request)
+    if ws == "sandbox":
+        response_data["demo_otp"] = otp
+
+    return response_data
+
 class StatusLookupRequest(BaseModel):
     application_no: str
     otp: str = "123456"
 
 @router.post("/workflow/status-lookup")
-def public_status_lookup(payload: StatusLookupRequest, db: Session = Depends(get_db)):
+def public_status_lookup(
+    payload: StatusLookupRequest,
+    request: Request,
+    db: Session = Depends(get_db)
+):
     """
     Public & Institution status lookup by Application ID + OTP.
     Builds the stage path dynamically from the application's Table 2.3 route.
-    Shows SAC only for appeals and SHC only when compliance verification applies;
-    never shows them universally for every application.
+    Validates dynamic one-time password (stored as hash, 10m expiry, 5 attempts max)
+    or Evaluator Mode demo PIN (123456) in sandbox workspace.
     """
-    if not settings.DEMO_MODE:
-        if payload.otp == "123456":
+    app_no = payload.application_no.strip()
+    clean_otp = payload.otp.strip()
+
+    client_ip = request.client.host if (request and request.client) else "127.0.0.1"
+    now_ts = datetime.utcnow().timestamp()
+    verify_ip_ts = _public_otp_ip_rate_limits.setdefault(f"verify:{client_ip}", [])
+    verify_ip_ts = [t for t in verify_ip_ts if now_ts - t < 60.0]
+    _public_otp_ip_rate_limits[f"verify:{client_ip}"] = verify_ip_ts
+    if len(verify_ip_ts) >= 15:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Please wait 1 minute before checking status again."
+        )
+    verify_ip_ts.append(now_ts)
+
+    is_valid = False
+
+    # Check Demo Mode bypass (strictly allowed ONLY in sandbox workspace)
+    ws = resolve_workspace(request)
+    if clean_otp == "123456":
+        if ws != "sandbox":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Demo OTP shortcut '123456' is disabled when DEMO_MODE=false. Production mandates dynamic mobile/email OTP."
+                detail="Demo OTP shortcut '123456' is strictly disabled in Live workspace. Production mandates dynamic mobile/email OTP."
             )
-    if payload.otp != "123456":
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid OTP verification code.")
+        is_valid = True
+
+    if not is_valid:
+        record = _public_tracking_otp_store.get(app_no)
+        if not record:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No active verification code found for this tracking ID. Please request an OTP first."
+            )
+
+        if datetime.utcnow() > record["expires_at"]:
+            _public_tracking_otp_store.pop(app_no, None)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Verification code has expired. Please request a new code."
+            )
+
+        if record["attempts_left"] <= 0:
+            _public_tracking_otp_store.pop(app_no, None)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Maximum verification attempts exceeded. Code has been invalidated. Please request a new OTP."
+            )
+
+        salt = settings.SECRET_KEY[:16]
+        candidate_hash = hashlib.sha256(f"{app_no}:{clean_otp}:{salt}".encode()).hexdigest()
+        if hmac.compare_digest(candidate_hash, record["otp_hash"]):
+            is_valid = True
+            _public_tracking_otp_store.pop(app_no, None)
+        else:
+            record["attempts_left"] -= 1
+            attempts_left = record["attempts_left"]
+            if attempts_left <= 0:
+                _public_tracking_otp_store.pop(app_no, None)
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Invalid verification code. Maximum attempts exceeded. Code invalidated."
+                )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Invalid verification code. {attempts_left} attempt(s) remaining."
+            )
 
     dal = ScopedDAL(db, RequestContext(role="PUBLIC"))
     app = dal.get_application_by_number(payload.application_no.strip())

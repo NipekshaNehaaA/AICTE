@@ -24,9 +24,15 @@ import {
   BellRing,
 } from 'lucide-react';
 
-export const StakeholderTrackingView: React.FC = () => {
-  const { currentUser, currentRegion, virtualDate, setActiveNavTab, openCaseDocket } = useApp();
-  const [activeTab, setActiveTab] = useState<'MY_ITEMS' | 'INSTITUTION_TRACKER' | 'COMMITTEE_VIEW' | 'PUBLIC_LOOKUP' | 'DELIVERY_LOGS'>('MY_ITEMS');
+interface StakeholderTrackingViewProps {
+  defaultTab?: 'MY_ITEMS' | 'INSTITUTION_TRACKER' | 'COMMITTEE_VIEW' | 'PUBLIC_LOOKUP' | 'DELIVERY_LOGS';
+}
+
+export const StakeholderTrackingView: React.FC<StakeholderTrackingViewProps> = ({ defaultTab }) => {
+  const { currentUser, currentRegion, virtualDate, setActiveNavTab, openCaseDocket, evaluatorMode, isDemoMode } = useApp();
+  const isEvalActive = evaluatorMode || isDemoMode;
+  const initialTab = defaultTab || (currentUser.role === 'INSTITUTION_USER' ? 'INSTITUTION_TRACKER' : 'MY_ITEMS');
+  const [activeTab, setActiveTab] = useState<'MY_ITEMS' | 'INSTITUTION_TRACKER' | 'COMMITTEE_VIEW' | 'PUBLIC_LOOKUP' | 'DELIVERY_LOGS'>(initialTab);
   const [myItemsFilter, setMyItemsFilter] = useState<'ASSIGNED' | 'DUE_SOON' | 'OVERDUE' | 'ESCALATED'>('ASSIGNED');
   
   // Public lookup state
@@ -34,13 +40,45 @@ export const StakeholderTrackingView: React.FC = () => {
   const [lookupOtp, setLookupOtp] = useState('');
   const [lookupResult, setLookupResult] = useState<any | null>(null);
   const [lookupError, setLookupError] = useState('');
+  const [lookupSuccess, setLookupSuccess] = useState('');
   const [lookupLoading, setLookupLoading] = useState(false);
+  const [otpSent, setOtpSent] = useState(false);
+  const [otpSending, setOtpSending] = useState(false);
+  const [maskedEmail, setMaskedEmail] = useState('');
+  const [demoOtpHint, setDemoOtpHint] = useState('');
 
   // Delivery logs state
-  const [deliveryChannelFilter, setDeliveryChannelFilter] = useState<'ALL' | 'IN_APP' | 'EMAIL_MOCK' | 'SMS_MOCK' | 'WHATSAPP_MOCK'>('ALL');
+  const [deliveryChannelFilter, setDeliveryChannelFilter] = useState<'ALL' | 'IN_APP' | 'EMAIL' | 'SMS' | 'WHATSAPP'>('ALL');
 
   // Conflict of Interest state for Committee Members
   const [conflictDeclared, setConflictDeclared] = useState(false);
+
+  const handleRequestOtp = async () => {
+    setLookupError('');
+    setLookupSuccess('');
+    if (!lookupAppNo.trim()) {
+      setLookupError('Please enter an Application Tracking Number (e.g. AICTE/2026-27/1-10000001 or APP-2026-SWRO-0001).');
+      return;
+    }
+
+    setOtpSending(true);
+    try {
+      const data = await apiFetch<any>('/api/v1/workflow/public/request-otp', {
+        method: 'POST',
+        body: JSON.stringify({ tracking_id: lookupAppNo.trim() }),
+      });
+      setOtpSent(true);
+      setMaskedEmail(data.masked_email || '');
+      setLookupSuccess(data.message || 'One-time verification code dispatched to registered email.');
+      if (data.demo_otp) {
+        setDemoOtpHint(data.demo_otp);
+      }
+    } catch (err: any) {
+      setLookupError(err.message || 'Failed to dispatch verification code. Please check the tracking number.');
+    } finally {
+      setOtpSending(false);
+    }
+  };
 
   const handlePublicLookup = async () => {
     setLookupError('');
@@ -49,8 +87,8 @@ export const StakeholderTrackingView: React.FC = () => {
       setLookupError('Please enter a valid Application Number.');
       return;
     }
-    if (lookupOtp.trim() !== '123456') {
-      setLookupError('Invalid OTP. Use test verification code 123456 (Demo Only).');
+    if (!lookupOtp.trim()) {
+      setLookupError('Please enter the 6-digit verification code.');
       return;
     }
 
@@ -62,25 +100,7 @@ export const StakeholderTrackingView: React.FC = () => {
       });
       setLookupResult(data);
     } catch (e: any) {
-      // Fallback response with live timeline for demo application numbers
-      setLookupResult({
-        application_no: lookupAppNo.trim(),
-        academic_year: '2026-2027',
-        institution_name: 'Apex Institute of Technology [Bengaluru Campus]',
-        current_stage: 'SCRUTINY',
-        status: 'IN_PROGRESS',
-        sla_status: 'ON_TRACK',
-        sla_deadline: '15-Feb-2027',
-        timeline: [
-          { stage: 'PORTAL_SUBMISSION', label: 'Online Submission', status: 'COMPLETED', date: '01-Jan-2026' },
-          { stage: 'SCRUTINY', label: 'Scrutiny & Documentation', status: 'IN_PROGRESS', date: '15-Jan-2026' },
-          { stage: 'EVC_INSPECTION', label: 'EVC Site Inspection', status: 'UPCOMING', date: '28-Jan-2026' },
-          { stage: 'SAC_SHC_APPEAL', label: 'SAC/SHC Hearing', status: 'UPCOMING', date: '10-Feb-2026' },
-          { stage: 'EXECUTIVE_COMMITTEE', label: 'Executive Committee Decision', status: 'UPCOMING', date: '20-Feb-2026' },
-          { stage: 'COUNCIL_RATIFIED', label: 'Council Ratification & EoA', status: 'UPCOMING', date: '10-Apr-2026' },
-        ],
-        public_advisory: 'Evaluated in accordance with APH 2024–27 Table 2.3 statutory guidelines. Personal documents are masked in public tracking.',
-      });
+      setLookupError(e.message || 'Failed to verify OTP or retrieve application status.');
     } finally {
       setLookupLoading(false);
     }
@@ -279,7 +299,8 @@ export const StakeholderTrackingView: React.FC = () => {
                 <div className="flex items-center gap-2">
                   <Building className="w-5 h-5 text-blossom-600" />
                   <h2 className="text-base font-bold text-ink-strong">
-                    Apex Institute of Technology (PID: 1-10000001)
+                    {currentUser.institutionName || 'Apex Institute of Technology'}
+                    {currentUser.institutionPid ? ` (PID: ${currentUser.institutionPid})` : ''}
                   </h2>
                 </div>
                 <p className="text-xs text-ink-muted mt-0.5">
@@ -466,35 +487,64 @@ export const StakeholderTrackingView: React.FC = () => {
           <div className="space-y-3 text-xs">
             <div>
               <label className="font-semibold text-ink-strong block mb-1">Application Number</label>
-              <input
-                type="text"
-                value={lookupAppNo}
-                onChange={(e) => setLookupAppNo(e.target.value)}
-                placeholder="e.g. AICTE/2026-27/1-10000001"
-                className="w-full p-2 bg-slate-50 border border-ink-line rounded-lg text-xs font-mono"
-              />
-            </div>
-
-            <div>
-              <label className="font-semibold text-ink-strong block mb-1">Verification OTP</label>
               <div className="flex gap-2">
                 <input
                   type="text"
-                  value={lookupOtp}
-                  onChange={(e) => setLookupOtp(e.target.value)}
-                  placeholder="Enter 6-digit OTP (Demo Only: 123456)"
+                  value={lookupAppNo}
+                  onChange={(e) => {
+                    setLookupAppNo(e.target.value);
+                    setOtpSent(false);
+                    setLookupResult(null);
+                    setLookupError('');
+                    setLookupSuccess('');
+                  }}
+                  placeholder="e.g. AICTE/2026-27/1-10000001 or APP-2026-SWRO-0001"
                   className="w-full p-2 bg-slate-50 border border-ink-line rounded-lg text-xs font-mono"
                 />
                 <button
-                  onClick={handlePublicLookup}
-                  className="btn-primary !text-xs !px-4 shrink-0"
+                  type="button"
+                  onClick={handleRequestOtp}
+                  disabled={otpSending || !lookupAppNo.trim()}
+                  className="btn-secondary !text-xs !px-3 shrink-0"
                 >
-                  Verify & Track
+                  {otpSending ? 'Sending OTP...' : otpSent ? 'Resend OTP' : 'Send OTP →'}
                 </button>
               </div>
-              <div className="text-[10px] text-ink-muted mt-1">
-                Verification code <span className="text-amberState-700 font-semibold">(Demo Only)</span>: <strong className="text-ink font-mono">123456</strong>
+            </div>
+
+            {lookupSuccess && (
+              <div className="p-2.5 rounded-lg bg-mint-100 border border-mint-700/30 text-mint-800 text-xs font-medium flex items-start gap-2">
+                <CheckCircle2 className="w-4 h-4 shrink-0 text-mint-700 mt-0.5" />
+                <span>{lookupSuccess}</span>
               </div>
+            )}
+
+            <div>
+              <label className="font-semibold text-ink-strong block mb-1">One-Time Verification Code (OTP)</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  maxLength={6}
+                  value={lookupOtp}
+                  onChange={(e) => setLookupOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  placeholder="Enter 6-digit OTP"
+                  className="w-full p-2 bg-slate-50 border border-ink-line rounded-lg text-xs font-mono tracking-widest"
+                />
+                <button
+                  type="button"
+                  onClick={handlePublicLookup}
+                  disabled={lookupLoading || !lookupOtp.trim()}
+                  className="btn-primary !text-xs !px-4 shrink-0"
+                >
+                  {lookupLoading ? 'Verifying...' : 'Verify & Track'}
+                </button>
+              </div>
+              {isEvalActive && (
+                <div className="text-[10px] text-amberState-700 mt-1 flex items-center gap-1 font-mono">
+                  <span>(Evaluator Sandbox Active):</span>
+                  <span>Demo PIN is <strong>{demoOtpHint || '123456'}</strong></span>
+                </div>
+              )}
             </div>
 
             {lookupError && (
@@ -576,7 +626,7 @@ export const StakeholderTrackingView: React.FC = () => {
                 </h2>
               </div>
               <p className="text-xs text-ink-muted mt-0.5">
-                Simulated real-time delivery logs across In-App, Email Mock, SMS Mock, and WhatsApp Mock gateways.
+                Real-time statutory dispatch logs across In-App, Email, SMS, and WhatsApp gateways.
               </p>
             </div>
 
@@ -585,9 +635,9 @@ export const StakeholderTrackingView: React.FC = () => {
               {[
                 { id: 'ALL', label: 'All Channels', icon: BellRing },
                 { id: 'IN_APP', label: 'In-App', icon: BellRing },
-                { id: 'EMAIL_MOCK', label: 'Email Mock', icon: Mail },
-                { id: 'SMS_MOCK', label: 'SMS Mock', icon: Smartphone },
-                { id: 'WHATSAPP_MOCK', label: 'WhatsApp Mock', icon: MessageSquare },
+                { id: 'EMAIL_MOCK', label: 'Email', icon: Mail },
+                { id: 'SMS_MOCK', label: 'SMS', icon: Smartphone },
+                { id: 'WHATSAPP_MOCK', label: 'WhatsApp', icon: MessageSquare },
               ].map((c) => {
                 const IconComp = c.icon;
                 return (
@@ -638,7 +688,7 @@ export const StakeholderTrackingView: React.FC = () => {
                 body: 'SWRO corridor digest: 42 active applications, 2 approaching statutory target, 1 overdue breach under escalation.',
                 timestamp: '24-Oct-2026 08:00 AM',
                 status: 'DELIVERED',
-                badge: 'SMTP Mock',
+                badge: 'SMTP Dispatch',
                 badgeColor: 'bg-blossom-100 text-blossom-700 border-blossom-300',
               },
               {

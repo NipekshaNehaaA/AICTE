@@ -104,18 +104,27 @@ class User(Base):
     institution_id = Column(String(36), ForeignKey("institutions.id"), nullable=True, index=True)
     
     mfa_enabled = Column(Boolean, default=False)
-    mfa_secret = Column(String(64), nullable=True)
+    mfa_secret = Column(String(255), nullable=True) # Encrypted at rest
+    mfa_pending_secret = Column(String(255), nullable=True) # Encrypted at rest during enrollment
+    mfa_recovery_codes = Column(Text, nullable=True) # JSON list of hashed single-use recovery codes
+    last_mfa_timestep = Column(Integer, nullable=True) # Last 30s epoch timestep used (replay protection)
+    must_change_password = Column(Boolean, default=False)
     failed_login_attempts = Column(Integer, default=0)
     locked_until = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
     email_verified = Column(Boolean, default=True)
     verification_token = Column(String(100), nullable=True)
+    verification_token_expires_at = Column(DateTime, nullable=True)
     reset_password_token = Column(String(100), nullable=True)
     reset_token_expires_at = Column(DateTime, nullable=True)
+    token_version = Column(Integer, default=0)
     whatsapp_phone = Column(String(30), nullable=True)
     opt_in_whatsapp = Column(Boolean, default=False)
     preferred_language = Column(String(10), default="en") # en, hi, ta
     preferred_channels = Column(String(100), default="IN_APP,EMAIL") # comma-separated
+    quiet_hours_start = Column(Integer, default=22) # 22:00 (10 PM)
+    quiet_hours_end = Column(Integer, default=6)    # 06:00 (6 AM)
+    quiet_hours_enabled = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     region = relationship("Region", back_populates="users")
@@ -187,8 +196,10 @@ class ApplicationStage(Base):
     sla_days_allotted = Column(Integer, default=7) # sample value, configurable
     sla_days_spent = Column(Float, default=0.0)
     handler_role = Column(String(50), default="REGIONAL_OFFICER")
+    assigned_user_id = Column(String(36), ForeignKey("users.id"), nullable=True)
 
     application = relationship("Application", back_populates="stages")
+    assigned_user = relationship("User", foreign_keys=[assigned_user_id])
 
 
 class CaseEvent(Base):
@@ -309,6 +320,31 @@ class EVCAssignment(Base):
     user = relationship("User", back_populates="evc_assignments")
 
 
+class CaseAssignment(Base):
+    """
+    Role- and stage-specific case reviewer assignments.
+    Governs assignment-based document and docket access:
+    - Scrutiny Member: SCRUTINY, RE_SCRUTINY
+    - EVC Expert: EVC, EVC_SCHEDULED, EVC_COMMITTEE
+    - SAC/SHC Member: SAC_SHC, SHC_HEARING, SAC_APPEAL
+    Access automatically ceases when stage advances or is_active=False.
+    """
+    __tablename__ = "case_assignments"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    application_id = Column(String(36), ForeignKey("applications.id"), nullable=False, index=True)
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    stage_name = Column(String(50), nullable=False) # SCRUTINY, RE_SCRUTINY, EVC, SAC_SHC, etc.
+    role = Column(String(50), nullable=False) # SCRUTINY_MEMBER, COMMITTEE_MEMBER, SAC_SHC_MEMBER
+    is_active = Column(Boolean, default=True)
+    assigned_at = Column(DateTime, default=datetime.utcnow)
+    revoked_at = Column(DateTime, nullable=True)
+
+    application = relationship("Application", backref="case_assignments")
+    user = relationship("User", backref="assigned_cases")
+
+
+
 class EVCReport(Base):
     """
     Official inspection verdict submitted by the EVC panel.
@@ -356,6 +392,7 @@ class InstitutionalDocument(Base):
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
     institution_id = Column(String(36), ForeignKey("institutions.id"), nullable=False, index=True)
+    application_id = Column(String(36), ForeignKey("applications.id"), nullable=True, index=True)
     doc_type_id = Column(String(36), ForeignKey("document_types.id"), nullable=False)
     document_number = Column(String(100), nullable=False)
     file_url = Column(String(255), nullable=False)
@@ -381,6 +418,7 @@ class InstitutionalDocument(Base):
 
     institution = relationship("Institution", back_populates="documents")
     doc_type = relationship("DocumentType")
+    application = relationship("Application", backref="documents")
 
 
 class TimeBoundUndertaking(Base):

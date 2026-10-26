@@ -39,6 +39,7 @@ class ConfirmPanelRequest(BaseModel):
     notes: Optional[str] = "Panel confirmed in accordance with Annexure-16 Clause 16.5."
 
 class ConflictDeclarationRequest(BaseModel):
+    panel_id: Optional[str] = None
     has_conflict: bool = False
     statement: str = "I declare no past employment, consultancy, or financial interest with this institution in the last 5 years."
 
@@ -555,6 +556,71 @@ def confirm_evc_schedule(
         "members_confirmed": payload.selected_member_ids,
     }
 
+@router.post("/{panel_id}/declare-conflict")
+@router.post("/declare-conflict")
+def declare_conflict_of_interest(
+    payload: ConflictDeclarationRequest,
+    panel_id: Optional[str] = None,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+):
+    """
+    EVC Committee Member officially declares presence or absence of conflict of interest.
+    Annexure-16 Clause 16.5 statutory compliance.
+    """
+    target_panel_id = panel_id or payload.panel_id
+    if not target_panel_id:
+        raise HTTPException(status_code=400, detail="Panel ID must be specified.")
+
+    panel = db.query(EVCPanel).filter(EVCPanel.id == target_panel_id).first()
+    if not panel:
+        raise HTTPException(status_code=404, detail="EVC Panel not found.")
+
+    asg = db.query(EVCAssignment).filter(
+        EVCAssignment.panel_id == panel.id,
+        EVCAssignment.user_id == ctx.user_id
+    ).first()
+
+    if not asg:
+        asg = EVCAssignment(
+            panel_id=panel.id,
+            user_id=ctx.user_id or "exp-member",
+            role_in_panel="EXPERT_MEMBER",
+        )
+        db.add(asg)
+
+    asg.conflict_of_interest_declared = payload.has_conflict
+    asg.conflict_statement = payload.statement
+
+    db.add(CaseEvent(
+        application_id=panel.application_id,
+        event_type="EVC_CONFLICT_DECLARATION",
+        actor_id=ctx.user_id,
+        actor_role=ctx.role,
+        description=f"Conflict of interest declared: {payload.has_conflict}. Statement: {payload.statement}",
+        aph_clause_ref="Annexure-16 Clause 16.5 (Conflict of Interest Protocol)",
+    ))
+
+    dal = ScopedDAL(db, ctx)
+    dal.append_audit_entry(
+        action_type="EVC_CONFLICT_DECLARATION",
+        entity_type="EVC_PANEL",
+        entity_id=panel.id,
+        metadata={
+            "panel_id": panel.id,
+            "has_conflict": payload.has_conflict,
+            "statement": payload.statement,
+        },
+    )
+    db.commit()
+
+    return {
+        "status": "CONFLICT_DECLARED",
+        "panel_id": panel.id,
+        "has_conflict": payload.has_conflict,
+        "statement": payload.statement,
+    }
+
 # -----------------------------------------------------------------------------
 # .ICS CALENDAR INVITATION EXPORT (RFC 5545)
 # -----------------------------------------------------------------------------
@@ -645,6 +711,7 @@ def submit_evc_inspection_report(
         is_final=True,
     )
     db.add(report)
+    db.flush()
     panel.status = "REPORT_SUBMITTED"
 
     app = panel.application

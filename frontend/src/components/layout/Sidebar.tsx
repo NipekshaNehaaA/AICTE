@@ -292,9 +292,12 @@ export const Sidebar: React.FC = () => {
             {currentUser.regionCode}
           </span>
         </div>
-        {currentUser.institutionName && (
-          <div className="text-[10px] text-ink-muted truncate mt-1 bg-amber-50 p-1 rounded border border-amber-200">
-            {currentUser.institutionName}
+        {currentUser.role === 'INSTITUTION_USER' && currentUser.institutionName && (
+          <div className="text-[10px] text-ink-muted truncate mt-1 bg-amber-50 p-1.5 rounded border border-amber-200">
+            <div className="font-semibold text-ink-strong truncate">{currentUser.institutionName}</div>
+            {currentUser.institutionPid && (
+              <div className="font-mono text-[9px] text-amber-800 mt-0.5">PID: {currentUser.institutionPid}</div>
+            )}
           </div>
         )}
       </div>

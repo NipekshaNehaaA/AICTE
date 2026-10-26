@@ -112,6 +112,7 @@ class RegulatorySchedulerService:
         active_docs = db.query(InstitutionalDocument).filter(
             InstitutionalDocument.is_latest_version == True,
             InstitutionalDocument.status.in_(["ACTIVE", "EXPIRING_SOON", "EXPIRED"]),
+            InstitutionalDocument.status != "SUPERSEDED",
         ).all()
 
         for doc in active_docs:
@@ -567,16 +568,41 @@ class RegulatorySchedulerService:
         return dispatched
 
     def _run_scheduled_job(self):
-        """Worker function invoked periodically by APScheduler on the real clock."""
-        db = SessionLocal()
+        """Worker function invoked periodically by APScheduler running per workspace."""
+        from app.database import get_session_maker
+        from app.workspace import current_workspace_var
+
+        # 1. Run for Live workspace (always real clock)
         try:
-            logger.info("Executing scheduled regulatory compliance & SLA evaluation...")
-            stats = self.evaluate_and_dispatch_all(db)
-            logger.info(f"Evaluation complete: {stats}")
+            live_sm = get_session_maker("live")
+            live_db = live_sm()
+            token = current_workspace_var.set("live")
+            try:
+                logger.info("Executing scheduled regulatory compliance & SLA evaluation for [live] workspace...")
+                stats_live = self.evaluate_and_dispatch_all(live_db, target_time=datetime.utcnow())
+                logger.info(f"Live evaluation complete: {stats_live}")
+            finally:
+                current_workspace_var.reset(token)
+                live_db.close()
         except Exception as e:
-            logger.error(f"Error during scheduled evaluation: {e}", exc_info=True)
-        finally:
-            db.close()
+            logger.error(f"Error during Live evaluation: {e}", exc_info=True)
+
+        # 2. Run for Sandbox workspace (real clock unless time travel is active)
+        try:
+            sandbox_sm = get_session_maker("sandbox")
+            sandbox_db = sandbox_sm()
+            token_sb = current_workspace_var.set("sandbox")
+            try:
+                from app.routers.demo_scenario import _demo_clock
+                sb_clock = _demo_clock if _demo_clock else datetime.utcnow()
+                logger.info("Executing scheduled regulatory compliance & SLA evaluation for [sandbox] workspace...")
+                stats_sb = self.evaluate_and_dispatch_all(sandbox_db, target_time=sb_clock)
+                logger.info(f"Sandbox evaluation complete: {stats_sb}")
+            finally:
+                current_workspace_var.reset(token_sb)
+                sandbox_db.close()
+        except Exception as e:
+            logger.error(f"Error during Sandbox evaluation: {e}", exc_info=True)
 
     def start_scheduler(self, interval_minutes: int = 60):
         """Initializes and starts the APScheduler background thread with startup catch-up."""

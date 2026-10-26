@@ -3,6 +3,7 @@ Configuration settings for AICTE Approval Workflow Automation & Compliance Syste
 """
 
 import os
+from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
 from pydantic import BaseModel, Field
@@ -43,10 +44,18 @@ class Settings(BaseModel):
             or os.getenv("DEMO_MODE", "false").lower() in ("true", "1", "yes")
         )
     )
+    EVALUATOR_ALLOW_TOGGLE: bool = Field(
+        default_factory=lambda: os.getenv("EVALUATOR_ALLOW_TOGGLE", "false").lower() in ("true", "1", "yes")
+    )
     
     # Brute-force Lockout Policy
     MAX_LOGIN_ATTEMPTS: int = 5
     LOCKOUT_DURATION_MINUTES: int = 15
+
+    # TOTP MFA & Encryption
+    MFA_ENCRYPTION_KEY: Optional[str] = os.getenv("MFA_ENCRYPTION_KEY", None)
+    ADMIN_EMAIL: str = os.getenv("ADMIN_EMAIL", "admin@aicte-india.org")
+    ADMIN_INITIAL_PASSWORD: str = os.getenv("ADMIN_INITIAL_PASSWORD", "AdminInitialPass@2026")
     
     # Storage Configuration (Local Disk or MinIO S3)
     STORAGE_BACKEND: str = os.getenv("STORAGE_BACKEND", "local") # 'local' or 'minio'

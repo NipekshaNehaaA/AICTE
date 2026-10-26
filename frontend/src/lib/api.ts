@@ -34,6 +34,28 @@ export function unregisterLogoutHandler() {
   globalLogoutHandler = null;
 }
 
+export type WorkspaceType = 'live' | 'sandbox';
+
+export function getActiveWorkspace(): WorkspaceType {
+  if (typeof window !== 'undefined') {
+    const ws = localStorage.getItem('aicte_workspace');
+    if (ws === 'live' || ws === 'sandbox') return ws;
+  }
+  return 'sandbox';
+}
+
+export function setActiveWorkspace(ws: WorkspaceType) {
+  if (typeof window !== 'undefined') {
+    localStorage.setItem('aicte_workspace', ws);
+    window.dispatchEvent(new CustomEvent('aicte:workspace_changed', { detail: { workspace: ws } }));
+  }
+}
+
+export function getAuthTokenForWorkspace(ws: WorkspaceType = getActiveWorkspace()): string | null {
+  if (typeof window === 'undefined') return null;
+  return localStorage.getItem(`aicte_auth_token_${ws}`) || localStorage.getItem('aicte_auth_token');
+}
+
 export interface ApiFetchOptions extends RequestInit {
   skipAuth?: boolean;
 }
@@ -52,13 +74,17 @@ export async function apiFetch<T = any>(
   // Prepare headers
   const reqHeaders = new Headers(headers);
 
+  // Set active workspace header if not explicitly provided
+  const activeWs = getActiveWorkspace();
+  if (!reqHeaders.has('X-Workspace')) {
+    reqHeaders.set('X-Workspace', activeWs);
+  }
+
   // Attach token if available and not skipped
   if (!skipAuth && !reqHeaders.has('Authorization')) {
-    if (typeof window !== 'undefined') {
-      const token = localStorage.getItem('aicte_auth_token');
-      if (token) {
-        reqHeaders.set('Authorization', `Bearer ${token}`);
-      }
+    const token = getAuthTokenForWorkspace(activeWs);
+    if (token) {
+      reqHeaders.set('Authorization', `Bearer ${token}`);
     }
   }
 
@@ -121,11 +147,13 @@ export async function apiFetchResponse(
     : `${API_BASE}${endpoint.startsWith('/') ? '' : '/'}${endpoint}`;
 
   const reqHeaders = new Headers(headers);
+  const activeWs = getActiveWorkspace();
+  if (!reqHeaders.has('X-Workspace')) {
+    reqHeaders.set('X-Workspace', activeWs);
+  }
   if (!skipAuth && !reqHeaders.has('Authorization')) {
-    if (typeof window !== 'undefined') {
-      const token = localStorage.getItem('aicte_auth_token');
-      if (token) reqHeaders.set('Authorization', `Bearer ${token}`);
-    }
+    const token = getAuthTokenForWorkspace(activeWs);
+    if (token) reqHeaders.set('Authorization', `Bearer ${token}`);
   }
 
   let res: Response;

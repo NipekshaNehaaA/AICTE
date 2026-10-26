@@ -21,6 +21,7 @@ from app.models import (
     User,
     Application,
     ApplicationStage,
+    CaseAssignment,
     CaseEvent,
     StageRevert,
     RuleVersion,
@@ -80,11 +81,14 @@ DOCUMENT_TYPES_CONFIG = [
     {"name": "Pollution Control Board Consent Certificate", "code": "POLLUTION_NOC", "category": "ENVIRONMENT", "years": 3, "offsets": "90,45,15"},
 ]
 
-def seed_database():
-    init_db()
+def seed_database(workspace: str = "sandbox"):
+    from app.database import init_db, get_session_maker
+    ws = (workspace or "sandbox").strip().lower()
+    init_db(ws)
+    SessionLocal = get_session_maker(ws)
     db: Session = SessionLocal()
 
-    # Clear and sync schema for clean demo seed
+    # Clear and sync schema for clean seed
     try:
         from app.database import Base
         Base.metadata.drop_all(bind=db.get_bind())
@@ -92,7 +96,7 @@ def seed_database():
     except Exception as e:
         print("Schema sync warning:", e)
 
-    print("--- 1. Seeding Configurable Regions (Sample List) ---")
+    print(f"--- 1. Seeding Configurable Regions ({ws.upper()} Workspace) ---")
     regions_map = {}
     for r_data in SAMPLE_REGIONS_CONFIG:
         reg = Region(
@@ -168,114 +172,190 @@ def seed_database():
     print("--- 5. Seeding Core Users (Officers, Admins, Auditors, Committee Members) ---")
     default_pw_hash = hash_password("DemoPassword@123")
 
-    # Super Admin / Senior Authority (HQ)
-    admin_user = User(
-        email="member.secretary@aicte-india.org",
-        password_hash=default_pw_hash,
-        full_name="Dr. Arvind Ramanathan (Member Secretary)",
-        role="SUPER_ADMIN",
-        region_id=None,
-        mfa_enabled=True,
-    )
-    db.add(admin_user)
+    from app.config import settings
+    ws = (workspace or "sandbox").strip().lower()
+    is_live = (ws == "live")
 
-    # Bureau Head (HQ - Assumed Escalation Level L3)
-    bureau_head_user = User(
-        email="bureau.head@aicte-india.org",
-        password_hash=default_pw_hash,
-        full_name="Dr. M. S. Jayaprakash (Bureau Head, Assumed Escalation)",
-        role="BUREAU_HEAD",
-        region_id=None,
-        mfa_enabled=True,
-    )
-    db.add(bureau_head_user)
+    if is_live:
+        # Live workspace: only admin user from env (ADMIN_EMAIL, ADMIN_INITIAL_PASSWORD), 0 demo users, 0 demo institutions
+        admin_email = (settings.ADMIN_EMAIL or os.getenv("ADMIN_EMAIL", "admin@aicte-india.org")).strip().lower()
+        admin_pass = settings.ADMIN_INITIAL_PASSWORD or os.getenv("ADMIN_INITIAL_PASSWORD", "AdminInitialPass@2026")
+        admin_user = db.query(User).filter(User.email == admin_email).first()
+        if not admin_user:
+            admin_user = User(
+                email=admin_email,
+                password_hash=hash_password(admin_pass),
+                full_name="AICTE System Administrator",
+                role="SUPER_ADMIN",
+                region_id=None,
+                mfa_enabled=True,
+                must_change_password=True,
+                is_active=True,
+            )
+            db.add(admin_user)
+            db.flush()
 
-    # Bureau Officer (HQ)
-    bureau_user = User(
-        email="approval.bureau@aicte-india.org",
-        password_hash=default_pw_hash,
-        full_name="Shri Anand K. Sharma (Approval Bureau Officer)",
-        role="BUREAU_OFFICER",
-        region_id=None,
-        mfa_enabled=True,
-    )
-    db.add(bureau_user)
+        # Initial Root Hash for Audit Trail
+        init_audit = AuditTrail(
+            prev_entry_hash="0" * 64,
+            curr_entry_hash=hashlib.sha256(b"AICTE_GENESIS_SIH26262_AUDIT_ROOT").hexdigest(),
+            actor_id=admin_user.id,
+            actor_role="SUPER_ADMIN",
+            action_type="SYSTEM_GENESIS",
+            entity_type="SYSTEM",
+            entity_id="ROOT",
+            metadata_json='{"event": "Live environment initialized with administrative root"}',
+            ip_address="127.0.0.1",
+        )
+        db.add(init_audit)
 
-    # SAC / SHC Appellate Committee Member (Pan-India)
-    sac_user = User(
-        email="sac.appellate@aicte-india.org",
-        password_hash=default_pw_hash,
-        full_name="Justice (Retd.) K. V. Narayanan (SAC Member)",
-        role="SAC_SHC_MEMBER",
-        region_id=None,
-        mfa_enabled=False,
-    )
-    db.add(sac_user)
+        # Seed Admin-Entered Public Notice & Academic Calendar (Clause 1.8 & 2.25)
+        academic_cal = AcademicCalendar(
+            academic_year="2026-2027",
+            public_notice_date=date(2026, 1, 15),
+            portal_open_date=date(2026, 2, 1),
+            portal_close_date=date(2026, 3, 15),
+            scrutiny_cutoff_date=date(2026, 4, 15),
+            evc_cutoff_date=date(2026, 5, 10),
+            sac_appeal_cutoff_date=date(2026, 5, 25),
+            eoa_final_cutoff_date=date(2026, 6, 10),
+            council_ratification_date=date(2026, 6, 30),
+            is_active=True,
+        )
+        db.add(academic_cal)
 
-    # Statutory Auditor (HQ - Read Only)
-    auditor_user = User(
-        email="auditor.compliance@aicte-india.org",
-        password_hash=default_pw_hash,
-        full_name="Smt. Priya Balan (Statutory Auditor)",
-        role="AUDITOR",
-        region_id=None,
-        mfa_enabled=False,
-    )
-    db.add(auditor_user)
-    db.flush()
-
-    # Regional Officers & Committee Members for each of the 7 regions
-    ro_users_map = {}
-    rd_users_map = {}
-    committee_users_map = {}
-    for code, reg in regions_map.items():
-        ro_user = User(
-            email=f"ro.{code.lower()}@aicte-india.org",
+        db.commit()
+        db.close()
+        print("Database seeded in LIVE mode: Only admin user created, 0 demo users, 0 demo institutions.")
+        return
+    else:
+        # Super Admin / Senior Authority (HQ Demo Account)
+        admin_user = User(
+            email="member.secretary@aicte-india.org",
             password_hash=default_pw_hash,
-            full_name=f"Dr. Regional Officer ({code} - {reg.city})",
-            role="REGIONAL_OFFICER",
-            region_id=reg.id,
+            full_name="Dr. Arvind Ramanathan (Member Secretary)",
+            role="SUPER_ADMIN",
+            region_id=None,
             mfa_enabled=True,
         )
-        db.add(ro_user)
+        db.add(admin_user)
         db.flush()
-        ro_users_map[code] = ro_user
 
-        rd_user = User(
-            email=f"rd.{code.lower()}@aicte-india.org",
+        # Seed additional admin if custom ADMIN_EMAIL specified in env
+        admin_env_email = os.getenv("ADMIN_EMAIL")
+        if admin_env_email and admin_env_email.strip().lower() != "member.secretary@aicte-india.org":
+            admin_pass = os.getenv("ADMIN_INITIAL_PASSWORD", "AdminInitialPass@2026")
+            env_admin = User(
+                email=admin_env_email.strip().lower(),
+                password_hash=hash_password(admin_pass),
+                full_name="AICTE System Administrator",
+                role="SUPER_ADMIN",
+                region_id=None,
+                mfa_enabled=True,
+                must_change_password=True,
+            )
+            db.add(env_admin)
+            db.flush()
+
+        # Bureau Head (HQ - Assumed Escalation Level L3)
+        bureau_head_user = User(
+            email="bureau.head@aicte-india.org",
             password_hash=default_pw_hash,
-            full_name=f"Dr. Regional Director ({code} - Assumed Escalation)",
-            role="REGIONAL_DIRECTOR",
-            region_id=reg.id,
+            full_name="Dr. M. S. Jayaprakash (Bureau Head, Assumed Escalation)",
+            role="BUREAU_HEAD",
+            region_id=None,
             mfa_enabled=True,
         )
-        db.add(rd_user)
-        db.flush()
-        rd_users_map[code] = rd_user
+        db.add(bureau_head_user)
 
-        cm_user = User(
-            email=f"expert.{code.lower()}@aicte-india.org",
+        # Bureau Officer (HQ)
+        bureau_user = User(
+            email="approval.bureau@aicte-india.org",
             password_hash=default_pw_hash,
-            full_name=f"Prof. EVC Expert ({code})",
-            role="COMMITTEE_MEMBER",
-            region_id=reg.id,
-            mfa_enabled=False,
+            full_name="Shri Anand K. Sharma (Approval Bureau Officer)",
+            role="BUREAU_OFFICER",
+            region_id=None,
+            mfa_enabled=True,
         )
-        db.add(cm_user)
-        db.flush()
-        committee_users_map[code] = cm_user
+        db.add(bureau_user)
 
-        # Scrutiny Committee Member
-        scrutiny_user = User(
-            email=f"scrutiny.{code.lower()}@aicte-india.org",
+        # SAC / SHC Appellate Committee Member (Pan-India)
+        sac_user = User(
+            email="sac.appellate@aicte-india.org",
             password_hash=default_pw_hash,
-            full_name=f"Prof. Scrutiny Member ({code})",
-            role="SCRUTINY_MEMBER",
-            region_id=reg.id,
-            mfa_enabled=False,
+            full_name="Justice (Retd.) K. V. Narayanan (SAC Member)",
+            role="SAC_SHC_MEMBER",
+            region_id=None,
+            mfa_enabled=True,
         )
-        db.add(scrutiny_user)
+        db.add(sac_user)
+
+        # Statutory Auditor (HQ - Read Only)
+        auditor_user = User(
+            email="auditor.compliance@aicte-india.org",
+            password_hash=default_pw_hash,
+            full_name="Smt. Priya Balan (Statutory Auditor)",
+            role="AUDITOR",
+            region_id=None,
+            mfa_enabled=True,
+        )
+        db.add(auditor_user)
         db.flush()
+
+        # Regional Officers & Committee Members for each of the 7 regions
+        ro_users_map = {}
+        rd_users_map = {}
+        committee_users_map = {}
+        scrutiny_users_map = {}
+        for code, reg in regions_map.items():
+            ro_user = User(
+                email=f"ro.{code.lower()}@aicte-india.org",
+                password_hash=default_pw_hash,
+                full_name=f"Dr. Regional Officer ({code} - {reg.city})",
+                role="REGIONAL_OFFICER",
+                region_id=reg.id,
+                mfa_enabled=True,
+            )
+            db.add(ro_user)
+            db.flush()
+            ro_users_map[code] = ro_user
+
+            rd_user = User(
+                email=f"rd.{code.lower()}@aicte-india.org",
+                password_hash=default_pw_hash,
+                full_name=f"Dr. Regional Director ({code} - Assumed Escalation)",
+                role="REGIONAL_DIRECTOR",
+                region_id=reg.id,
+                mfa_enabled=True,
+            )
+            db.add(rd_user)
+            db.flush()
+            rd_users_map[code] = rd_user
+
+            cm_user = User(
+                email=f"expert.{code.lower()}@aicte-india.org",
+                password_hash=default_pw_hash,
+                full_name=f"Prof. EVC Expert ({code})",
+                role="COMMITTEE_MEMBER",
+                region_id=reg.id,
+                mfa_enabled=True,
+            )
+            db.add(cm_user)
+            db.flush()
+            committee_users_map[code] = cm_user
+
+            # Scrutiny Committee Member
+            scrutiny_user = User(
+                email=f"scrutiny.{code.lower()}@aicte-india.org",
+                password_hash=default_pw_hash,
+                full_name=f"Prof. Scrutiny Member ({code})",
+                role="SCRUTINY_MEMBER",
+                region_id=reg.id,
+                mfa_enabled=True,
+            )
+            db.add(scrutiny_user)
+            db.flush()
+            scrutiny_users_map[code] = scrutiny_user
 
     print("--- 6. Seeding 210 Synthetic Technical Institutions (30 per Region) ---")
     institutions_list = []
@@ -356,6 +436,9 @@ def seed_database():
         sla_deadline = now + timedelta(days=random.randint(25, 50))
         sla_status = "ON_TRACK"
 
+        # Assign dealing officer or scrutiny reviewer
+        assigned_user = scrutiny_users_map[reg_code] if i < 10 else ro_user
+
         app = Application(
             application_no=app_no,
             institution_id=inst.id,
@@ -366,7 +449,7 @@ def seed_database():
             current_stage="SCRUTINY",
             status="IN_PROGRESS",
             submitter_id=inst_user.id,
-            assigned_officer_id=ro_user.id,
+            assigned_officer_id=assigned_user.id,
             verifier_id=None,
             approver_id=None,
             sla_deadline=sla_deadline,
@@ -385,8 +468,18 @@ def seed_database():
             started_at=app.submitted_at,
             due_at=sla_deadline,
             sla_days_allotted=21, # realistic statutory scrutiny timeline
+            assigned_user_id=assigned_user.id,
         )
         db.add(stage)
+
+        if i < 10:
+            db.add(CaseAssignment(
+                application_id=app.id,
+                stage_name="SCRUTINY",
+                user_id=assigned_user.id,
+                role="SCRUTINY_MEMBER",
+                is_active=True,
+            ))
 
         # Initial Case Event
         db.add(CaseEvent(
@@ -610,6 +703,38 @@ def seed_database():
                 conflict_statement="I hereby declare no past employment or consultancy with the institution in the last 5 years.",
                 attendance_confirmed=True,
             ))
+            db.add(CaseAssignment(
+                application_id=app_evc.id,
+                stage_name="EVC_SCHEDULED",
+                user_id=committee_users_map["SWRO"].id,
+                role="COMMITTEE_MEMBER",
+                is_active=True,
+            ))
+
+    # Seed a SAC/SHC Hearing case for sac_user
+    if len(institutions_list) > 25:
+        inst_sac = institutions_list[25]
+        app_sac = db.query(Application).filter(Application.institution_id == inst_sac.id).first()
+        if app_sac:
+            app_sac.current_stage = "SAC_SHC"
+            app_sac.assigned_officer_id = sac_user.id
+            db.add(CaseAssignment(
+                application_id=app_sac.id,
+                stage_name="SAC_SHC",
+                user_id=sac_user.id,
+                role="SAC_SHC_MEMBER",
+                is_active=True,
+            ))
+            db.add(ApplicationStage(
+                application_id=app_sac.id,
+                stage_name="SAC_SHC",
+                sequence_order=4,
+                status="ACTIVE",
+                started_at=now - timedelta(days=2),
+                due_at=now + timedelta(days=10),
+                sla_days_allotted=15,
+                assigned_user_id=sac_user.id,
+            ))
 
     # Seed an isolated AI Draft (SUGGEST-ONLY) with Human Gate
     ai_draft = LLMDraft(
@@ -660,4 +785,12 @@ def seed_database():
     print("Database seeding completed successfully!")
 
 if __name__ == "__main__":
-    seed_database()
+    ws_arg = sys.argv[1].lower() if len(sys.argv) > 1 else "both"
+    if ws_arg == "live":
+        seed_database("live")
+    elif ws_arg == "sandbox":
+        seed_database("sandbox")
+    else:
+        seed_database("live")
+        seed_database("sandbox")
+

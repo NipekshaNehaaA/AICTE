@@ -41,6 +41,8 @@ export const TopBar: React.FC = () => {
     setActiveNavTab,
     isDemoMode,
     evaluatorMode,
+    workspace,
+    setWorkspace,
   } = useApp();
 
   const [showRoleMenu, setShowRoleMenu] = useState(false);
@@ -72,57 +74,94 @@ export const TopBar: React.FC = () => {
 
       {/* Middle & Right Controls: Region, Time Travel, Alerts, Role Switcher */}
       <div className="flex items-center gap-3">
-        {/* Configurable AICTE Region Selector */}
-        <div className="relative">
+        {/* Workspace Pill Switcher */}
+        <div data-testid="topbar-workspace-pill" className="flex items-center bg-slate-100 p-0.5 rounded-lg border border-ink-line">
           <button
-            onClick={() => {
-              setShowRegionMenu(!showRegionMenu);
-              setShowRoleMenu(false);
-              setShowNotifMenu(false);
-            }}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-50 hover:bg-slate-100 border border-ink-line rounded-lg text-xs font-semibold text-ink transition-all"
-            title="Switch Regional Office Scope"
+            type="button"
+            data-testid="topbar-switch-live"
+            onClick={() => setWorkspace('live')}
+            className={`px-2 py-1 rounded text-[11px] font-bold transition-all flex items-center gap-1 ${
+              workspace === 'live'
+                ? 'bg-emerald-600 text-white shadow-xs'
+                : 'text-ink-muted hover:text-ink'
+            }`}
           >
-            <MapPin className="w-3.5 h-3.5 text-blossom-600" />
-            <span className="truncate max-w-[140px]">{currentRegion.code} ({currentRegion.city})</span>
-            <ChevronDown className="w-3.5 h-3.5 text-ink-muted" />
+            <span className={`w-1.5 h-1.5 rounded-full ${workspace === 'live' ? 'bg-white' : 'bg-emerald-500'}`} />
+            Live
           </button>
-
-          {showRegionMenu && (
-            <div className="absolute right-0 mt-2 w-72 bg-white rounded-xl shadow-card border border-ink-line p-2 z-50">
-              <div className="text-[11px] font-bold text-ink-muted uppercase tracking-wider px-2 py-1 border-b border-slate-100">
-                AICTE Regional Offices (Configurable)
-              </div>
-              <div className="max-h-60 overflow-y-auto mt-1 space-y-0.5">
-                {SAMPLE_REGIONS.map((region) => (
-                  <button
-                    key={region.code}
-                    onClick={() => {
-                      setRegionByCode(region.code);
-                      setShowRegionMenu(false);
-                    }}
-                    className={`w-full text-left px-2 py-2 rounded-lg text-xs flex items-center justify-between transition-colors ${
-                      currentRegion.code === region.code
-                        ? 'bg-blossom-100 font-bold text-ink-strong'
-                        : 'hover:bg-slate-50 text-ink'
-                    }`}
-                  >
-                    <div>
-                      <div className="font-semibold">{region.name}</div>
-                      <div className="text-[10px] text-ink-muted">{region.city}</div>
-                    </div>
-                    <span className="text-[10px] font-bold px-1.5 py-0.5 bg-slate-100 rounded text-ink-muted">
-                      {region.activeCasesCount} cases
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
+          <button
+            type="button"
+            data-testid="topbar-switch-sandbox"
+            onClick={() => setWorkspace('sandbox')}
+            className={`px-2 py-1 rounded text-[11px] font-bold transition-all flex items-center gap-1 ${
+              workspace === 'sandbox'
+                ? 'bg-amber-500 text-slate-950 shadow-xs'
+                : 'text-ink-muted hover:text-ink'
+            }`}
+          >
+            <span className={`w-1.5 h-1.5 rounded-full ${workspace === 'sandbox' ? 'bg-black' : 'bg-amber-500'}`} />
+            Sandbox
+          </button>
         </div>
 
-        {/* TIME-TRAVEL SIMULATOR & DEMO SCRIPT (EVALUATOR MODE ONLY) */}
-        {(evaluatorMode || isDemoMode) && (
+        {/* Configurable AICTE Region Selector */}
+        {(currentUser.role === 'SUPER_ADMIN' || currentUser.role === 'AUDITOR' || workspace === 'sandbox') ? (
+          <div className="relative">
+            <button
+              onClick={() => {
+                setShowRegionMenu(!showRegionMenu);
+                setShowRoleMenu(false);
+                setShowNotifMenu(false);
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-50 hover:bg-slate-100 border border-ink-line rounded-lg text-xs font-semibold text-ink transition-all"
+              title="Switch Regional Office Scope"
+            >
+              <MapPin className="w-3.5 h-3.5 text-blossom-600" />
+              <span className="truncate max-w-[140px]">{currentRegion.code} ({currentRegion.city})</span>
+              <ChevronDown className="w-3.5 h-3.5 text-ink-muted" />
+            </button>
+
+            {showRegionMenu && (
+              <div className="absolute right-0 mt-2 w-72 bg-white rounded-xl shadow-card border border-ink-line p-2 z-50">
+                <div className="text-[11px] font-bold text-ink-muted uppercase tracking-wider px-2 py-1 border-b border-slate-100">
+                  AICTE Regional Offices (Configurable)
+                </div>
+                <div className="max-h-60 overflow-y-auto mt-1 space-y-0.5">
+                  {SAMPLE_REGIONS.map((region) => (
+                    <button
+                      key={region.code}
+                      onClick={() => {
+                        setRegionByCode(region.code);
+                        setShowRegionMenu(false);
+                      }}
+                      className={`w-full text-left px-2 py-2 rounded-lg text-xs flex items-center justify-between transition-colors ${
+                        currentRegion.code === region.code
+                          ? 'bg-blossom-100 font-bold text-ink-strong'
+                          : 'hover:bg-slate-50 text-ink'
+                      }`}
+                    >
+                      <div>
+                        <div className="font-semibold">{region.name}</div>
+                        <div className="text-[10px] text-ink-muted">{region.city}</div>
+                      </div>
+                      <span className="text-[10px] font-bold px-1.5 py-0.5 bg-slate-100 rounded text-ink-muted">
+                        {region.activeCasesCount} cases
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-50 border border-ink-line rounded-lg text-xs font-semibold text-ink">
+            <MapPin className="w-3.5 h-3.5 text-blossom-600" />
+            <span className="truncate max-w-[140px]">{currentRegion.code} ({currentRegion.city})</span>
+          </div>
+        )}
+
+        {/* TIME-TRAVEL SIMULATOR & DEMO SCRIPT (SANDBOX ONLY) */}
+        {workspace === 'sandbox' && (
           <>
             <div className="flex items-center bg-slate-100/80 rounded-lg p-1 border border-ink-line/80 gap-1">
               <div className="flex items-center gap-1 px-2 text-xs font-bold text-ink-strong">
@@ -258,87 +297,99 @@ export const TopBar: React.FC = () => {
           )}
         </div>
 
-        {/* DEMO ROLE SWITCHER (ONE-CLICK SWITCHER) */}
-        <div className="relative">
-          <button
-            data-testid="role-menu-button"
-            onClick={() => {
-              setShowRoleMenu(!showRoleMenu);
-              setShowRegionMenu(false);
-              setShowNotifMenu(false);
-            }}
-            className="flex items-center gap-2 pl-2 pr-3 py-1.5 bg-blossom-100 hover:bg-blossom-300/40 border border-blossom-300 rounded-lg text-xs font-semibold text-ink-strong transition-all shadow-soft"
-          >
+        {/* Production User Profile or Evaluator Demo Role Switcher */}
+        {workspace === 'sandbox' ? (
+          <div className="relative">
+            <button
+              data-testid="role-menu-button"
+              onClick={() => {
+                setShowRoleMenu(!showRoleMenu);
+                setShowRegionMenu(false);
+                setShowNotifMenu(false);
+              }}
+              className="flex items-center gap-2 pl-2 pr-3 py-1.5 bg-blossom-100 hover:bg-blossom-300/40 border border-blossom-300 rounded-lg text-xs font-semibold text-ink-strong transition-all shadow-soft"
+            >
+              <div className="w-6 h-6 rounded-md bg-blossom-600 text-white flex items-center justify-center font-bold text-xs">
+                {currentUser.name.charAt(0)}
+              </div>
+              <div className="text-left">
+                <div className="leading-none text-[11px] font-bold text-blossom-700">Role: {currentUser.roleLabel} <span className="text-[9px] text-amberState-700 font-semibold">(Demo Only)</span></div>
+              </div>
+              <ChevronDown className="w-3.5 h-3.5 text-ink-muted" />
+            </button>
+
+            {showRoleMenu && (
+              <div className="absolute right-0 mt-2 w-72 bg-white rounded-xl shadow-card border border-ink-line p-2 z-50">
+                <div className="text-[11px] font-bold text-amberState-700 uppercase tracking-wider px-2 py-1 border-b border-slate-100 flex items-center justify-between">
+                  <span>Role Switcher</span>
+                  <span className="text-[9px] bg-amberState-100 px-1.5 py-0.5 rounded font-mono">Demo Only</span>
+                </div>
+                <div className="space-y-1 mt-1">
+                  {(Object.keys(DEMO_USERS) as UserRole[]).map((roleKey) => {
+                    const u = DEMO_USERS[roleKey];
+                    const isSelected = currentUser.role === u.role;
+                    return (
+                      <button
+                        key={roleKey}
+                        data-testid={`switch-role-${roleKey}`}
+                        onClick={() => {
+                          switchRole(roleKey);
+                          setShowRoleMenu(false);
+                        }}
+                        className={`w-full text-left px-2.5 py-2 rounded-lg text-xs flex items-center justify-between transition-colors ${
+                          isSelected
+                            ? 'bg-blossom-100 font-bold text-ink-strong border-l-4 border-blossom-600'
+                            : 'hover:bg-slate-50 text-ink'
+                        }`}
+                      >
+                        <div>
+                          <div className="font-bold text-ink-strong">{u.roleLabel}</div>
+                          <div className="text-[10px] text-ink-muted">{u.name}</div>
+                        </div>
+                        <span className="text-[9px] px-1.5 py-0.5 bg-slate-100 rounded text-ink-muted font-bold">
+                          {u.regionCode}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="pt-1 mt-1 border-t border-slate-100 space-y-0.5">
+                  <button
+                    onClick={() => {
+                      setShowRoleMenu(false);
+                      restartBootSequence();
+                    }}
+                    className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs text-ink-muted hover:text-ink hover:bg-slate-50 font-medium flex items-center gap-1.5 transition-colors"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5 text-blossom-600" />
+                    <span>Reboot System Diagnostics</span>
+                  </button>
+                  <button
+                    data-testid="logout-button"
+                    onClick={() => {
+                      setShowRoleMenu(false);
+                      logout();
+                    }}
+                    className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs text-roseState-700 hover:bg-roseState-100/50 font-bold flex items-center gap-1.5 transition-colors"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                    <span>Sign Out of Session</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 pl-2 pr-3 py-1.5 bg-slate-50 border border-ink-line rounded-lg text-xs font-semibold text-ink-strong">
             <div className="w-6 h-6 rounded-md bg-blossom-600 text-white flex items-center justify-center font-bold text-xs">
               {currentUser.name.charAt(0)}
             </div>
             <div className="text-left">
-              <div className="leading-none text-[11px] font-bold text-blossom-700">Role: {currentUser.roleLabel} <span className="text-[9px] text-amberState-700 font-semibold">(Demo Only)</span></div>
+              <div className="leading-none text-[11px] font-bold text-ink-strong">{currentUser.name}</div>
+              <div className="text-[10px] text-ink-muted">{currentUser.roleLabel}</div>
             </div>
-            <ChevronDown className="w-3.5 h-3.5 text-ink-muted" />
-          </button>
-
-          {showRoleMenu && (
-            <div className="absolute right-0 mt-2 w-72 bg-white rounded-xl shadow-card border border-ink-line p-2 z-50">
-              <div className="text-[11px] font-bold text-amberState-700 uppercase tracking-wider px-2 py-1 border-b border-slate-100 flex items-center justify-between">
-                <span>Role Switcher</span>
-                <span className="text-[9px] bg-amberState-100 px-1.5 py-0.5 rounded font-mono">Demo Only</span>
-              </div>
-              <div className="space-y-1 mt-1">
-                {(Object.keys(DEMO_USERS) as UserRole[]).map((roleKey) => {
-                  const u = DEMO_USERS[roleKey];
-                  const isSelected = currentUser.role === u.role;
-                  return (
-                    <button
-                      key={roleKey}
-                      data-testid={`switch-role-${roleKey}`}
-                      onClick={() => {
-                        switchRole(roleKey);
-                        setShowRoleMenu(false);
-                      }}
-                      className={`w-full text-left px-2.5 py-2 rounded-lg text-xs flex items-center justify-between transition-colors ${
-                        isSelected
-                          ? 'bg-blossom-100 font-bold text-ink-strong border-l-4 border-blossom-600'
-                          : 'hover:bg-slate-50 text-ink'
-                      }`}
-                    >
-                      <div>
-                        <div className="font-bold text-ink-strong">{u.roleLabel}</div>
-                        <div className="text-[10px] text-ink-muted">{u.name}</div>
-                      </div>
-                      <span className="text-[9px] px-1.5 py-0.5 bg-slate-100 rounded text-ink-muted font-bold">
-                        {u.regionCode}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-              <div className="pt-1 mt-1 border-t border-slate-100 space-y-0.5">
-                <button
-                  onClick={() => {
-                    setShowRoleMenu(false);
-                    restartBootSequence();
-                  }}
-                  className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs text-ink-muted hover:text-ink hover:bg-slate-50 font-medium flex items-center gap-1.5 transition-colors"
-                >
-                  <RotateCcw className="w-3.5 h-3.5 text-blossom-600" />
-                  <span>Reboot System Diagnostics</span>
-                </button>
-                <button
-                  data-testid="logout-button"
-                  onClick={() => {
-                    setShowRoleMenu(false);
-                    logout();
-                  }}
-                  className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs text-roseState-700 hover:bg-roseState-100/50 font-bold flex items-center gap-1.5 transition-colors"
-                >
-                  <LogOut className="w-3.5 h-3.5" />
-                  <span>Sign Out of Session</span>
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
+          </div>
+        )}
 
         {/* Dedicated Sign Out Button */}
         <button

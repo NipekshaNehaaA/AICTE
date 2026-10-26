@@ -17,7 +17,7 @@ import os
 import uuid
 from datetime import datetime, date, timedelta
 from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -25,6 +25,7 @@ from app.database import get_db
 from app.config import settings
 from app.scoped_dal import ScopedDAL, RequestContext
 from app.auth import get_request_context
+from app.workspace import require_workspace, set_sandbox_override, get_sandbox_override
 from app.models import (
     User,
     Region,
@@ -46,7 +47,14 @@ from app.rules_engine import APHRulesEngine, APH_CLAUSE_CATALOG
 from app.sla_engine import SLAEngine
 import hashlib
 
-router = APIRouter(prefix="/api/v1/demo", tags=["Demo Scripted Scenario & Time Travel"])
+def require_sandbox_workspace(request: Request):
+    require_workspace("sandbox", request)
+
+router = APIRouter(
+    prefix="/api/v1/demo",
+    tags=["Demo Scripted Scenario & Time Travel"],
+    dependencies=[Depends(require_sandbox_workspace)],
+)
 
 # In-memory virtual clock tracking
 _demo_clock = datetime.utcnow()
@@ -63,12 +71,27 @@ class ScenarioStepResponse(BaseModel):
     timestamp: str
     details: Dict[str, Any]
 
+class SandboxOverrideRequest(BaseModel):
+    override_email: Optional[str] = None
+    override_whatsapp: Optional[str] = None
+
+@router.get("/sandbox-override")
+def get_override_settings():
+    """Returns current override email/WhatsApp for sandbox notifications."""
+    return get_sandbox_override()
+
+@router.post("/sandbox-override")
+def update_override_settings(payload: SandboxOverrideRequest):
+    """Sets override email/WhatsApp so sandbox notifications go to evaluator instead of fake institutions."""
+    set_sandbox_override(payload.override_email, payload.override_whatsapp)
+    return {
+        "status": "UPDATED",
+        "overrides": get_sandbox_override()
+    }
+
 def check_evaluator_mode():
-    if not (getattr(settings, "EVALUATOR_MODE", False) or getattr(settings, "DEMO_MODE", False)):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Evaluator / Demo Mode is disabled in production mode (EVALUATOR_MODE=False).",
-        )
+    """No-op retained for backwards compatibility: router dependency enforces sandbox isolation."""
+    pass
 
 @router.get("/time-travel/status")
 def get_time_travel_status():
@@ -79,8 +102,9 @@ def get_time_travel_status():
         "virtual_time_iso": _demo_clock.isoformat(),
         "drift_days": drift_days,
         "is_time_warped": drift_days != 0,
-        "demo_mode": settings.DEMO_MODE,
-        "evaluator_mode": getattr(settings, "EVALUATOR_MODE", False),
+        "workspace": "sandbox",
+        "demo_mode": True,
+        "evaluator_mode": True,
     }
 
 @router.post("/time-travel")

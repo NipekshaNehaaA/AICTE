@@ -55,6 +55,15 @@ test.describe('AICTE Persona Smoke & Robustness Verification', () => {
         await skipButton.click();
       }
 
+      // Ensure Evaluator Mode is ON to activate 1-Click Personas
+      const evalBtn = page.locator('button:has-text("Evaluator Mode:")');
+      if (await evalBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        const text = await evalBtn.innerText();
+        if (text.includes('OFF')) {
+          await evalBtn.click();
+        }
+      }
+
       // Step 2: Switch to 1-Click Personas tab
       const tabPersonas = page.locator('[data-testid="tab-personas"]');
       await expect(tabPersonas).toBeVisible({ timeout: 10000 });

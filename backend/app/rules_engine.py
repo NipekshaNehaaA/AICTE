@@ -622,6 +622,14 @@ class APHRulesEngine:
         if current_stage in ["SAC_HEARING", "STANDING_HEARING", "SHC_HEARING"]:
             return "EXECUTIVE_COMMITTEE"
 
+        if pipeline_name in ["SCRUTINY_EVC", "NEW_INSTITUTION"]:
+            stages = CHAPTER_1_NEW_INSTITUTION_ROUTING["stages"]
+            if current_stage in stages:
+                curr_idx = stages.index(current_stage)
+                if curr_idx + 1 < len(stages):
+                    return stages[curr_idx + 1]
+                return None
+
         for p_key, p_val in TABLE_2_3_SEEDED_ROUTING.items():
             if p_val["pipeline_name"] == pipeline_name:
                 stages = p_val["stages"]

@@ -318,3 +318,51 @@ def test_cross_region_download_rejected_with_403(db):
     # Must be strictly 403 Forbidden!
     assert resp_cross.status_code == 403
     assert "not have statutory authorization" in resp_cross.json()["detail"]
+
+
+def test_minio_storage_service_interface():
+    """Verify MinIOStorageService operations and factory fallback."""
+    from unittest.mock import MagicMock, patch
+    from app.storage import MinIOStorageService, get_storage_service, LocalStorageService
+    from app.config import settings
+
+    mock_client = MagicMock()
+    mock_client.bucket_exists.return_value = True
+
+    # Test save
+    with patch("minio.Minio", return_value=mock_client):
+        svc = MinIOStorageService(
+            endpoint="minio.test:9000",
+            access_key="test_user",
+            secret_key="test_pass",
+            bucket="test-bucket",
+            secure=False,
+        )
+        test_bytes = b"%PDF-1.4 Mock MinIO File"
+        key = svc.save(test_bytes, "institutions/inst-01/DOC.pdf", "application/pdf")
+        assert key == "institutions/inst-01/DOC.pdf"
+        mock_client.put_object.assert_called_once()
+
+        # Test get
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = test_bytes
+        mock_client.get_object.return_value = mock_resp
+        retrieved = svc.get(key)
+        assert retrieved == test_bytes
+
+        # Test exists
+        mock_client.stat_object.return_value = MagicMock()
+        assert svc.exists(key) is True
+
+        # Test delete
+        assert svc.delete(key) is True
+        mock_client.remove_object.assert_called_once_with("test-bucket", key)
+
+    # Test get_storage_service factory
+    orig_backend = settings.STORAGE_BACKEND
+    try:
+        settings.STORAGE_BACKEND = "local"
+        assert isinstance(get_storage_service(), LocalStorageService)
+    finally:
+        settings.STORAGE_BACKEND = orig_backend
+

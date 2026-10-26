@@ -40,8 +40,21 @@ export const NotificationCenterView: React.FC = () => {
   const [prefChannels, setPrefChannels] = useState<string[]>(['IN_APP', 'EMAIL']);
   const [whatsappPhone, setWhatsappPhone] = useState('+91-9876543210');
   const [optInWhatsapp, setOptInWhatsapp] = useState(false);
+  const [quietHoursStart, setQuietHoursStart] = useState<number>(22);
+  const [quietHoursEnd, setQuietHoursEnd] = useState<number>(6);
+  const [quietHoursEnabled, setQuietHoursEnabled] = useState<boolean>(true);
   const [savingPrefs, setSavingPrefs] = useState(false);
   const [prefSuccess, setPrefSuccess] = useState(false);
+
+  // Test Message State
+  const [testModalOpen, setTestModalOpen] = useState(false);
+  const [testSending, setTestSending] = useState(false);
+  const [testResults, setTestResults] = useState<any | null>(null);
+  const [testChannels, setTestChannels] = useState<string[]>(['IN_APP', 'EMAIL', 'WHATSAPP_SANDBOX']);
+  const [testLang, setTestLang] = useState('en');
+  const [testTemplate, setTestTemplate] = useState('DEFICIENCY_CURE_NOTICE');
+  const [testEmailOverride, setTestEmailOverride] = useState('');
+  const [testWhatsappOverride, setTestWhatsappOverride] = useState('');
 
   const fetchNotificationsAndScheduler = async () => {
     setLoading(true);
@@ -64,6 +77,15 @@ export const NotificationCenterView: React.FC = () => {
           setWhatsappPhone(prefData.whatsapp_phone);
         }
         setOptInWhatsapp(Boolean(prefData.opt_in_whatsapp));
+        if (prefData.quiet_hours_start !== undefined) {
+          setQuietHoursStart(prefData.quiet_hours_start);
+        }
+        if (prefData.quiet_hours_end !== undefined) {
+          setQuietHoursEnd(prefData.quiet_hours_end);
+        }
+        if (prefData.quiet_hours_enabled !== undefined) {
+          setQuietHoursEnabled(Boolean(prefData.quiet_hours_enabled));
+        }
       }
     } catch (err) {
       console.error('Failed to load notification center data', err);
@@ -124,6 +146,9 @@ export const NotificationCenterView: React.FC = () => {
           preferred_channels: prefChannels.join(','),
           whatsapp_phone: whatsappPhone,
           opt_in_whatsapp: optInWhatsapp,
+          quiet_hours_start: quietHoursStart,
+          quiet_hours_end: quietHoursEnd,
+          quiet_hours_enabled: quietHoursEnabled,
         }),
       });
       setPrefSuccess(true);
@@ -132,6 +157,29 @@ export const NotificationCenterView: React.FC = () => {
       alert(`Failed to save preferences: ${err?.message || 'Error'}`);
     } finally {
       setSavingPrefs(false);
+    }
+  };
+
+  const handleSendTestMessage = async () => {
+    setTestSending(true);
+    setTestResults(null);
+    try {
+      const data = await apiFetch<any>('/api/v1/alerts/test-dispatch', {
+        method: 'POST',
+        body: JSON.stringify({
+          channels: testChannels,
+          language: testLang,
+          recipient_email: testEmailOverride || undefined,
+          recipient_whatsapp: testWhatsappOverride || undefined,
+          template_key: testTemplate,
+        }),
+      });
+      setTestResults(data);
+      fetchNotificationsAndScheduler();
+    } catch (err: any) {
+      alert(`Test dispatch failed: ${err?.message || 'Error'}`);
+    } finally {
+      setTestSending(false);
     }
   };
 
@@ -158,7 +206,6 @@ export const NotificationCenterView: React.FC = () => {
               <Bell className="w-5 h-5 text-blossom-600" />
               Statutory Notification & Alert Dispatch Centre
             </h1>
-            <span className="badge-sample-value">Task 2 Real Engine</span>
           </div>
           <p className="text-xs text-ink-muted mt-1">
             Real APScheduler clock, multi-channel dispatch (Real SMTP, Twilio WhatsApp sandbox, In-App), static reviewed multilingual templates, and idempotency protection.
@@ -166,6 +213,13 @@ export const NotificationCenterView: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2.5">
+          <button
+            onClick={() => setTestModalOpen(true)}
+            data-testid="send-test-notification-btn"
+            className="px-3 py-1.5 bg-blossom-50 hover:bg-blossom-100 border border-blossom-200 text-blossom-800 rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 shadow-xs"
+          >
+            <Send className="w-3.5 h-3.5 text-blossom-600" /> Send Test Notification
+          </button>
           <button
             onClick={() => setShowPreferences(true)}
             className="px-3 py-1.5 bg-slate-50 hover:bg-slate-100 border border-ink-line text-ink-strong rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 shadow-xs"
@@ -513,22 +567,356 @@ export const NotificationCenterView: React.FC = () => {
                   </span>
                 </label>
               </div>
+
+              {/* Quiet Hours Configuration */}
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="font-bold text-ink-strong flex items-center gap-1.5">
+                    <Clock className="w-3.5 h-3.5 text-blossom-600" />
+                    <span>Quiet Hours & Nighttime Deferral</span>
+                  </label>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={quietHoursEnabled}
+                      onChange={(e) => setQuietHoursEnabled(e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-8 h-4 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-blossom-600"></div>
+                  </label>
+                </div>
+                <p className="text-[10px] text-ink-muted">
+                  Non-emergency reminders triggered during quiet hours will be held in <code className="font-mono text-amber-700 bg-amber-50 px-1 rounded">DEFERRED_QUIET_HOURS</code> status until the window expires.
+                </p>
+                {quietHoursEnabled && (
+                  <div className="grid grid-cols-2 gap-2 pt-1">
+                    <div>
+                      <span className="text-[10px] font-semibold text-ink-muted block mb-0.5">Start Time</span>
+                      <select
+                        value={quietHoursStart}
+                        onChange={(e) => setQuietHoursStart(Number(e.target.value))}
+                        className="w-full p-1.5 bg-white border border-slate-300 rounded-lg text-xs"
+                      >
+                        {Array.from({ length: 24 }).map((_, i) => (
+                          <option key={i} value={i}>
+                            {i.toString().padStart(2, '0')}:00 ({i === 0 ? '12 AM' : i < 12 ? `${i} AM` : i === 12 ? '12 PM' : `${i - 12} PM`})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <span className="text-[10px] font-semibold text-ink-muted block mb-0.5">End Time</span>
+                      <select
+                        value={quietHoursEnd}
+                        onChange={(e) => setQuietHoursEnd(Number(e.target.value))}
+                        className="w-full p-1.5 bg-white border border-slate-300 rounded-lg text-xs"
+                      >
+                        {Array.from({ length: 24 }).map((_, i) => (
+                          <option key={i} value={i}>
+                            {i.toString().padStart(2, '0')}:00 ({i === 0 ? '12 AM' : i < 12 ? `${i} AM` : i === 12 ? '12 PM' : `${i - 12} PM`})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between pt-3 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowPreferences(false);
+                  setTestModalOpen(true);
+                }}
+                className="text-[11px] text-blossom-600 hover:text-blossom-700 font-semibold flex items-center gap-1"
+              >
+                <Send className="w-3 h-3" />
+                <span>Test Delivery Now &rarr;</span>
+              </button>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setShowPreferences(false)}
+                  className="btn-secondary !text-xs"
+                >
+                  Close
+                </button>
+                <button
+                  onClick={handleSavePreferences}
+                  disabled={savingPrefs}
+                  className="btn-primary !text-xs flex items-center gap-1"
+                >
+                  {savingPrefs ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                  Save Preferences
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* REAL TEST NOTIFICATION DISPATCH MODAL */}
+      {testModalOpen && (
+        <div className="fixed inset-0 bg-ink-strong/50 backdrop-blur-xs flex items-center justify-center z-50 p-4 animate-fade-in">
+          <div className="bg-white rounded-2xl shadow-2xl border border-ink-line w-full max-w-lg p-6 space-y-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-lg bg-blossom-100 text-blossom-600 flex items-center justify-center font-bold">
+                  <Send className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-ink-strong">
+                    Dispatch Real Test Statutory Notification
+                  </h3>
+                  <p className="text-[11px] text-ink-muted">
+                    Sends actual messages over configured channels and returns live provider receipts.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => {
+                  setTestModalOpen(false);
+                  setTestResults(null);
+                }}
+                className="p-1 hover:bg-slate-100 rounded-lg text-ink-muted transition-colors"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-4 text-xs">
+              {/* Channel Selection */}
+              <div>
+                <label className="font-semibold text-ink-strong block mb-1.5">
+                  Select Channels to Test
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    { id: 'IN_APP', label: 'In-App Alert', icon: Bell },
+                    { id: 'EMAIL', label: 'Real SMTP Email', icon: Mail },
+                    { id: 'WHATSAPP_SANDBOX', label: 'Twilio WhatsApp', icon: MessageSquare },
+                  ].map((ch) => {
+                    const isChecked = testChannels.includes(ch.id);
+                    const Icon = ch.icon;
+                    return (
+                      <button
+                        key={ch.id}
+                        type="button"
+                        onClick={() => {
+                          if (isChecked) {
+                            if (testChannels.length > 1) {
+                              setTestChannels(testChannels.filter((c) => c !== ch.id));
+                            }
+                          } else {
+                            setTestChannels([...testChannels, ch.id]);
+                          }
+                        }}
+                        className={`p-2.5 rounded-xl border text-center flex flex-col items-center gap-1 transition-all ${
+                          isChecked
+                            ? 'border-blossom-600 bg-blossom-50 text-blossom-800 font-bold shadow-xs'
+                            : 'border-slate-200 bg-slate-50 text-ink-muted hover:border-slate-300'
+                        }`}
+                      >
+                        <Icon className="w-4 h-4" />
+                        <span className="text-[11px]">{ch.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Language Selection */}
+              <div>
+                <label className="font-semibold text-ink-strong block mb-1.5">
+                  Notification Language
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    { code: 'en', label: 'English' },
+                    { code: 'hi', label: 'हिन्दी (Hindi)' },
+                    { code: 'ta', label: 'தமிழ் (Tamil)' },
+                  ].map((l) => (
+                    <button
+                      key={l.code}
+                      type="button"
+                      onClick={() => setTestLang(l.code)}
+                      className={`p-2 rounded-xl border text-center font-bold text-xs transition-all ${
+                        testLang === l.code
+                          ? 'border-blossom-600 bg-blossom-50 text-blossom-800'
+                          : 'border-slate-200 bg-slate-50 text-ink-muted hover:border-slate-300'
+                      }`}
+                    >
+                      {l.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Template Selection */}
+              <div>
+                <label className="font-semibold text-ink-strong block mb-1">
+                  Statutory Notification Template
+                </label>
+                <select
+                  value={testTemplate}
+                  onChange={(e) => setTestTemplate(e.target.value)}
+                  className="w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-xs text-ink-strong font-medium"
+                >
+                  <option value="DEFICIENCY_CURE_NOTICE">Deficiency Cure Window Notice (APH Clause 1.8(f))</option>
+                  <option value="LEASE_EXPIRY_WARNING">Land Lease Expiry Advisory (APH Clause 1.4.1(e))</option>
+                  <option value="EVC_SCHEDULE_NOTIFICATION">EVC Inspection Scheduled (APH Clause 1.9)</option>
+                  <option value="SLA_BREACH_ALERT">Statutory SLA Breach Alert (APH Clause 1.10)</option>
+                  <option value="UNDERTAKING_COMPLIANCE_REMINDER">Time-Bound Undertaking Reminder (APH Clause 2.23)</option>
+                </select>
+              </div>
+
+              {/* Recipient Overrides (Optional) */}
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
+                <span className="font-semibold text-ink-strong block text-[11px]">
+                  Custom Test Recipients (Optional Override)
+                </span>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[10px] text-ink-muted block">Test Email Address</label>
+                    <input
+                      type="email"
+                      value={testEmailOverride}
+                      onChange={(e) => setTestEmailOverride(e.target.value)}
+                      placeholder="e.g. officer@example.com"
+                      className="w-full p-1.5 bg-white border border-slate-300 rounded-lg text-xs"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-ink-muted block">Test WhatsApp Number (E.164)</label>
+                    <input
+                      type="text"
+                      value={testWhatsappOverride}
+                      onChange={(e) => setTestWhatsappOverride(e.target.value)}
+                      placeholder="e.g. +919876543210"
+                      className="w-full p-1.5 bg-white border border-slate-300 rounded-lg text-xs font-mono"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* LIVE PROVIDER RESPONSE RESULTS */}
+              {testResults && (
+                <div className="p-4 bg-slate-50 border border-ink-line rounded-xl space-y-3 animate-fade-in">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-ink-strong text-xs flex items-center gap-1.5">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                      Live Provider Dispatch Receipts
+                    </span>
+                    <span className="text-[10px] font-mono text-ink-muted">
+                      {new Date(testResults.dispatched_at).toLocaleTimeString()}
+                    </span>
+                  </div>
+
+                  <div className="space-y-2">
+                    {(testResults.results || []).map((r: any, idx: number) => {
+                      const isSuccess = r.status === 'DELIVERED';
+                      const isSimulated = r.status === 'SIMULATED';
+                      return (
+                        <div
+                          key={idx}
+                          className={`p-3 rounded-lg border text-xs space-y-1 ${
+                            isSuccess
+                              ? 'bg-emerald-50/70 border-emerald-200 text-emerald-950'
+                              : isSimulated
+                              ? 'bg-amber-50/70 border-amber-200 text-amber-950'
+                              : 'bg-rose-50/70 border-rose-200 text-rose-950'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between font-bold">
+                            <span>{r.channel}</span>
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-mono uppercase ${
+                              isSuccess
+                                ? 'bg-emerald-200 text-emerald-900'
+                                : isSimulated
+                                ? 'bg-amber-200 text-amber-900'
+                                : 'bg-rose-200 text-rose-900'
+                            }`}>
+                              {r.status}
+                            </span>
+                          </div>
+
+                          {r.receipt_id && (
+                            <div className="text-[11px] font-mono text-ink-muted truncate">
+                              Receipt ID: <span className="font-semibold text-ink-strong">{r.receipt_id}</span>
+                            </div>
+                          )}
+
+                          {r.recipient && (
+                            <div className="text-[11px] text-ink-slate">
+                              Target: <span className="font-mono">{r.recipient}</span>
+                            </div>
+                          )}
+
+                          {r.sandbox_note && (
+                            <div className="text-[10px] font-semibold text-amber-800 bg-amber-100/50 p-1.5 rounded">
+                              {r.sandbox_note}
+                            </div>
+                          )}
+
+                          {r.note && (
+                            <div className="text-[10px] text-ink-muted italic">
+                              {r.note}
+                            </div>
+                          )}
+
+                          {r.failure_reason && (
+                            <div className="text-[11px] text-rose-700 font-medium">
+                              Failure Details: {r.failure_reason}
+                            </div>
+                          )}
+
+                          {r.error_message && (
+                            <div className="text-[11px] text-rose-700 font-medium">
+                              Provider Error: {r.error_message}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <p className="text-[10px] text-ink-muted pt-1 border-t border-slate-200">
+                    Audit Trail: Dispatch event permanently stamped in the SHA-256 regulatory ledger.
+                  </p>
+                </div>
+              )}
             </div>
 
             <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
               <button
-                onClick={() => setShowPreferences(false)}
+                type="button"
+                onClick={() => {
+                  setTestModalOpen(false);
+                  setTestResults(null);
+                }}
                 className="btn-secondary !text-xs"
               >
                 Close
               </button>
               <button
-                onClick={handleSavePreferences}
-                disabled={savingPrefs}
-                className="btn-primary !text-xs flex items-center gap-1"
+                type="button"
+                data-testid="execute-test-dispatch-btn"
+                onClick={handleSendTestMessage}
+                disabled={testSending}
+                className="btn-primary !text-xs flex items-center gap-1.5"
               >
-                {savingPrefs ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
-                Save Preferences
+                {testSending ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Dispatching via Real Channels...</span>
+                  </>
+                ) : (
+                  <>
+                    <Send className="w-3.5 h-3.5" />
+                    <span>Dispatch Real Message</span>
+                  </>
+                )}
               </button>
             </div>
           </div>

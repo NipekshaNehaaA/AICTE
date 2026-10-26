@@ -19,6 +19,8 @@ from app.models import (
     User,
     Institution,
     Application,
+    ApplicationStage,
+    CaseAssignment,
     InstitutionalDocument,
     TimeBoundUndertaking,
     EVCPanel,
@@ -28,7 +30,10 @@ from app.models import (
     AuditTrail,
     CaseEvent,
     DocumentAnomaly,
+    Notification,
 )
+from app.email_service import email_service
+from app.twilio_whatsapp import twilio_whatsapp_client
 
 class SecurityScopeError(Exception):
     """Raised when an action violates RBAC or regional/institutional scope."""
@@ -51,12 +56,14 @@ class RequestContext:
         region_id: Optional[str] = None,
         institution_id: Optional[str] = None,
         ip_address: str = "127.0.0.1",
+        workspace: str = "live",
     ):
         self.user_id = user_id
         self.role = role
         self.region_id = region_id
         self.institution_id = institution_id
         self.ip_address = ip_address
+        self.workspace = workspace
 
     def is_empty(self) -> bool:
         return not bool(self.user_id and self.role)
@@ -180,16 +187,110 @@ class ScopedDAL:
                 return []
             return query.filter(Application.institution_id == self.ctx.institution_id).all()
 
-        elif role in ("COMMITTEE_MEMBER", "SCRUTINY_MEMBER", "SAC_SHC_MEMBER"):
-            # Scoped ONLY to assigned cases
+        elif role == "SCRUTINY_MEMBER":
+            # Scrutiny Member: Scoped ONLY to assigned cases while current stage is SCRUTINY or RE_SCRUTINY
             if not self.ctx.user_id:
                 return []
-            assigned_app_ids = (
+            scrutiny_stages = ["SCRUTINY", "RE_SCRUTINY"]
+            assigned_via_app = (
+                select(Application.id)
+                .filter(
+                    or_(
+                        Application.assigned_officer_id == self.ctx.user_id,
+                        Application.verifier_id == self.ctx.user_id,
+                    ),
+                    Application.current_stage.in_(scrutiny_stages),
+                )
+            )
+            assigned_via_stage = (
+                select(ApplicationStage.application_id)
+                .join(Application, Application.id == ApplicationStage.application_id)
+                .filter(
+                    ApplicationStage.assigned_user_id == self.ctx.user_id,
+                    ApplicationStage.status == "ACTIVE",
+                    Application.current_stage.in_(scrutiny_stages),
+                )
+            )
+            assigned_via_case = (
+                select(CaseAssignment.application_id)
+                .join(Application, Application.id == CaseAssignment.application_id)
+                .filter(
+                    CaseAssignment.user_id == self.ctx.user_id,
+                    CaseAssignment.is_active == True,
+                    CaseAssignment.stage_name.in_(scrutiny_stages),
+                    Application.current_stage.in_(scrutiny_stages),
+                )
+            )
+            return query.filter(
+                or_(
+                    Application.id.in_(assigned_via_app),
+                    Application.id.in_(assigned_via_stage),
+                    Application.id.in_(assigned_via_case),
+                )
+            ).all()
+
+        elif role == "COMMITTEE_MEMBER":
+            # EVC Committee Member (Expert): Scoped ONLY to assigned cases while current stage is EVC
+            if not self.ctx.user_id:
+                return []
+            evc_stages = ["EVC", "EVC_SCHEDULED", "EVC_COMMITTEE", "EVC_VISIT", "EVC_REPORT"]
+            assigned_via_panel = (
                 select(EVCPanel.application_id)
                 .join(EVCAssignment, EVCAssignment.panel_id == EVCPanel.id)
-                .filter(EVCAssignment.user_id == self.ctx.user_id)
+                .join(Application, Application.id == EVCPanel.application_id)
+                .filter(
+                    EVCAssignment.user_id == self.ctx.user_id,
+                    Application.current_stage.in_(evc_stages),
+                )
             )
-            return query.filter(Application.id.in_(assigned_app_ids)).all()
+            assigned_via_case = (
+                select(CaseAssignment.application_id)
+                .join(Application, Application.id == CaseAssignment.application_id)
+                .filter(
+                    CaseAssignment.user_id == self.ctx.user_id,
+                    CaseAssignment.is_active == True,
+                    CaseAssignment.stage_name.in_(evc_stages),
+                    Application.current_stage.in_(evc_stages),
+                )
+            )
+            return query.filter(
+                or_(
+                    Application.id.in_(assigned_via_panel),
+                    Application.id.in_(assigned_via_case),
+                )
+            ).all()
+
+        elif role == "SAC_SHC_MEMBER":
+            # SAC/SHC Member: Scoped ONLY to assigned hearing/appellate cases while active
+            if not self.ctx.user_id:
+                return []
+            sac_stages = ["SAC_SHC", "SHC_HEARING", "SAC_APPEAL", "STANDING_APPELLATE", "STANDING_HEARING"]
+            assigned_via_app = (
+                select(Application.id)
+                .filter(
+                    or_(
+                        Application.assigned_officer_id == self.ctx.user_id,
+                        Application.verifier_id == self.ctx.user_id,
+                    ),
+                    Application.current_stage.in_(sac_stages),
+                )
+            )
+            assigned_via_case = (
+                select(CaseAssignment.application_id)
+                .join(Application, Application.id == CaseAssignment.application_id)
+                .filter(
+                    CaseAssignment.user_id == self.ctx.user_id,
+                    CaseAssignment.is_active == True,
+                    CaseAssignment.stage_name.in_(sac_stages),
+                    Application.current_stage.in_(sac_stages),
+                )
+            )
+            return query.filter(
+                or_(
+                    Application.id.in_(assigned_via_app),
+                    Application.id.in_(assigned_via_case),
+                )
+            ).all()
 
         return []
 
@@ -231,10 +332,11 @@ class ScopedDAL:
         return None
 
     def advance_application_stage(
-        self, application_id: str, new_stage: str, remarks: str = ""
+        self, application_id: str, new_stage: str, remarks: str = "", next_officer_id: Optional[str] = None
     ) -> Application:
         """
-        Advances an application stage with pairwise Separation of Duties (SoD).
+        Advances an application stage with pairwise Separation of Duties (SoD),
+        updates stage status and active assignments, and dispatches handoff notifications.
         """
         if self.ctx.role == "AUDITOR":
             raise SecurityScopeError("Security Violation: Auditor role is strictly read-only.")
@@ -265,6 +367,59 @@ class ScopedDAL:
         app.current_stage = new_stage
         app.updated_at = datetime.utcnow()
 
+        # Update stage records in ApplicationStage
+        now = datetime.utcnow()
+        for st in (app.stages or []):
+            if st.stage_name == old_stage:
+                st.status = "PASSED"
+                st.completed_at = now
+            elif st.stage_name == new_stage:
+                st.status = "ACTIVE"
+                st.started_at = now
+                if next_officer_id:
+                    st.assigned_user_id = next_officer_id
+
+        # Update CaseAssignment records
+        # Revoke previous assignments that were tied to old stage
+        for ca in self.db.query(CaseAssignment).filter(
+            CaseAssignment.application_id == app.id,
+            CaseAssignment.is_active == True,
+            CaseAssignment.stage_name != new_stage,
+        ).all():
+            ca.is_active = False
+            ca.revoked_at = now
+
+        # Determine next stage officer
+        new_officer = None
+        if next_officer_id:
+            new_officer = self.db.query(User).filter(User.id == next_officer_id).first()
+
+        if not new_officer:
+            if new_stage in ("SCRUTINY", "RE_SCRUTINY"):
+                new_officer = self.db.query(User).filter(User.role == "SCRUTINY_MEMBER", User.region_id == app.region_id).first()
+                if not new_officer:
+                    new_officer = self.db.query(User).filter(User.role == "SCRUTINY_MEMBER").first()
+            elif new_stage in ("EVC", "EVC_SCHEDULED", "EVC_COMMITTEE", "EVC_VISIT"):
+                if app.evc_panel and app.evc_panel.assignments:
+                    new_officer = app.evc_panel.assignments[0].user
+                if not new_officer:
+                    new_officer = self.db.query(User).filter(User.role == "COMMITTEE_MEMBER", User.region_id == app.region_id).first()
+                    if not new_officer:
+                        new_officer = self.db.query(User).filter(User.role == "COMMITTEE_MEMBER").first()
+            elif new_stage in ("SAC_SHC", "SHC_HEARING", "SAC_APPEAL", "STANDING_APPELLATE", "STANDING_HEARING"):
+                new_officer = self.db.query(User).filter(User.role == "SAC_SHC_MEMBER").first()
+
+        if new_officer:
+            app.assigned_officer_id = new_officer.id
+            self.db.add(CaseAssignment(
+                application_id=app.id,
+                stage_name=new_stage,
+                user_id=new_officer.id,
+                role=new_officer.role,
+                is_active=True,
+                assigned_at=now,
+            ))
+
         # Append immutable case event
         event = CaseEvent(
             application_id=app.id,
@@ -281,8 +436,38 @@ class ScopedDAL:
             action_type="STAGE_ADVANCE",
             entity_type="APPLICATION",
             entity_id=app.id,
-            metadata={"from_stage": old_stage, "to_stage": new_stage, "remarks": remarks},
+            metadata={"from_stage": old_stage, "to_stage": new_stage, "remarks": remarks, "assigned_to": new_officer.id if new_officer else None},
         )
+        self.db.flush()
+
+        # Dispatch Handoff Notifications: Next Owner + Institution
+        deep_link = f"/case?id={app.id}"
+        if new_officer:
+            self.dispatch_notification(
+                user=new_officer,
+                title=f"Case Handoff: Application {app.application_no} Advanced to {new_stage}",
+                message=f"Application {app.application_no} has moved to stage {new_stage}. You are the designated stage reviewer.",
+                category="STAGE_HANDOFF",
+                severity="INFO",
+                deep_link=deep_link,
+                idempotency_key=f"handoff-{app.id}-{old_stage}-{new_stage}-{new_officer.id}",
+                application_id=app.id,
+            )
+
+        # Notify institution submitter
+        submitter = self.db.query(User).filter(User.id == app.submitter_id).first()
+        if submitter:
+            self.dispatch_notification(
+                user=submitter,
+                title=f"Application Progression: Stage Advanced to {new_stage}",
+                message=f"Your application {app.application_no} has advanced from {old_stage} to {new_stage}.",
+                category="STAGE_PROGRESS",
+                severity="INFO",
+                deep_link=deep_link,
+                idempotency_key=f"handoff-{app.id}-{old_stage}-{new_stage}-{submitter.id}",
+                application_id=app.id,
+            )
+
         self.db.commit()
         return app
 
@@ -315,15 +500,28 @@ class ScopedDAL:
                 return []
             return query.filter(InstitutionalDocument.institution_id == self.ctx.institution_id).all()
         elif role in ("COMMITTEE_MEMBER", "SCRUTINY_MEMBER", "SAC_SHC_MEMBER"):
+            # A user may list, preview and download documents of an application only while they
+            # are the assigned owner of its current stage, or a panel member of its EVC, or a named SAC/SHC reviewer.
+            # Access ends when the stage moves on.
             if not self.ctx.user_id:
                 return []
-            assigned_app_ids = (
-                select(EVCPanel.application_id)
-                .join(EVCAssignment, EVCAssignment.panel_id == EVCPanel.id)
-                .filter(EVCAssignment.user_id == self.ctx.user_id)
+            permitted_apps = self.get_applications()
+            if not permitted_apps:
+                return []
+            allowed_inst_ids = [a.institution_id for a in permitted_apps]
+            allowed_app_ids = [a.id for a in permitted_apps]
+            return (
+                query.filter(
+                    or_(
+                        InstitutionalDocument.application_id.in_(allowed_app_ids),
+                        and_(
+                            InstitutionalDocument.application_id.is_(None),
+                            InstitutionalDocument.institution_id.in_(allowed_inst_ids),
+                        ),
+                    )
+                )
+                .all()
             )
-            inst_ids = select(Application.institution_id).filter(Application.id.in_(assigned_app_ids))
-            return query.filter(InstitutionalDocument.institution_id.in_(inst_ids)).all()
         return []
 
     def get_document_by_id(self, document_id: str) -> Optional[InstitutionalDocument]:
@@ -487,3 +685,158 @@ class ScopedDAL:
         if not doc_ids:
             return []
         return query.filter(DocumentAnomaly.document_id.in_(doc_ids)).all()
+
+    def dispatch_notification(
+        self,
+        user: User,
+        title: str,
+        message: str,
+        category: str = "CASE_UPDATE",
+        severity: str = "INFO",
+        deep_link: str = "/case",
+        idempotency_key: str = "",
+        application_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Dispatches multi-channel notification (In-App, Real SMTP, WhatsApp)
+        with strict idempotency checking to prevent duplicates.
+        """
+        if not user or not user.id:
+            return {"status": "SKIPPED_NO_USER"}
+
+        clean_idemp = f"{idempotency_key}:IN_APP" if idempotency_key else None
+        if clean_idemp:
+            existing = self.db.query(Notification).filter(Notification.idempotency_key == clean_idemp).first()
+            if existing:
+                return {"status": "SKIPPED_IDEMPOTENT", "notification_id": existing.id}
+
+        now = datetime.utcnow()
+        full_msg = f"{message}\n\nCase Access Link: {deep_link}"
+
+        # 1. In-App Notification
+        notif = Notification(
+            user_id=user.id,
+            title=title,
+            message=full_msg,
+            category=category,
+            severity=severity,
+            scheduled_for=now,
+            fired_at=now,
+            is_read=False,
+            application_id=application_id,
+            delivery_channel="IN_APP",
+            delivery_status="DELIVERED",
+            recipient_contact=user.email,
+            language=getattr(user, "preferred_language", "en") or "en",
+            idempotency_key=clean_idemp,
+            receipt_id=f"rec_{now.timestamp()}",
+        )
+        self.db.add(notif)
+        self.db.flush()
+
+        # 2. Email Delivery (Real SMTP or test sink)
+        preferred_channels = (getattr(user, "preferred_channels", "IN_APP,EMAIL") or "IN_APP,EMAIL").split(",")
+        email_sent = False
+        if "EMAIL" in preferred_channels or user.email:
+            try:
+                email_service.send_email(
+                    to_email=user.email,
+                    subject=title,
+                    text_content=full_msg,
+                    html_content=f"<div style='font-family:sans-serif;padding:16px;'>"
+                                 f"<h3>{title}</h3>"
+                                 f"<p>{message}</p>"
+                                 f"<p><a href='http://127.0.0.1:3000{deep_link}'>View Case Docket</a></p>"
+                                 f"</div>",
+                    override_quiet=(severity == "CRITICAL"),
+                )
+                email_sent = True
+            except Exception:
+                pass
+
+        # 3. WhatsApp Delivery (Twilio Sandbox / Simulated fallback)
+        wa_sent = False
+        if "WHATSAPP" in preferred_channels or getattr(user, "opt_in_whatsapp", False):
+            if getattr(user, "whatsapp_phone", None):
+                try:
+                    twilio_whatsapp_client.send_whatsapp_message(
+                        to_phone=user.whatsapp_phone,
+                        body=f"{title}\n{message}\nAccess: http://127.0.0.1:3000{deep_link}",
+                    )
+                    wa_sent = True
+                except Exception:
+                    pass
+
+        return {
+            "status": "DISPATCHED",
+            "notification_id": notif.id,
+            "channels": {
+                "in_app": True,
+                "email": email_sent,
+                "whatsapp": wa_sent,
+            }
+        }
+
+    def dispatch_document_handoff(
+        self, doc: InstitutionalDocument, action: str = "UPLOAD"
+    ):
+        """
+        Notifies appropriate stakeholders when a document is uploaded, renewed, verified, or returned.
+        - Upload / Renew: Notifies active stage reviewer / dealing officer.
+        - Verified / Returned: Notifies submitting institution user.
+        """
+        app = None
+        if getattr(doc, "application_id", None):
+            app = self.db.query(Application).filter(Application.id == doc.application_id).first()
+        if not app:
+            app = self.db.query(Application).filter(
+                Application.institution_id == doc.institution_id,
+                Application.status.in_(["IN_PROGRESS", "DEFICIENT", "ESCALATED"]),
+            ).first()
+
+        deep_link = f"/case?id={app.id}" if app else f"/compliance?doc={doc.id}"
+        app_no = app.application_no if app else doc.document_number
+
+        if action in ("UPLOAD", "RENEW"):
+            recipient = None
+            if app and app.assigned_officer_id:
+                recipient = self.db.query(User).filter(User.id == app.assigned_officer_id).first()
+            if not recipient and app:
+                recipient = self.db.query(User).filter(User.role == "REGIONAL_OFFICER", User.region_id == app.region_id).first()
+
+            if recipient:
+                title = f"Document {'Renewed' if action == 'RENEW' else 'Uploaded'}: {doc.document_number}"
+                msg = f"A new version (v{doc.version}) of {doc.doc_type.name if doc.doc_type else 'statutory document'} was uploaded for {doc.institution.name if doc.institution else 'an institution'}. Please review in case docket {app_no}."
+                idemp = f"doc-{doc.id}-v{doc.version}-{action}-{recipient.id}"
+                self.dispatch_notification(
+                    user=recipient,
+                    title=title,
+                    message=msg,
+                    category="DOCUMENT_UPLOAD",
+                    severity="INFO",
+                    deep_link=deep_link,
+                    idempotency_key=idemp,
+                    application_id=app.id if app else None,
+                )
+
+        elif action in ("VERIFIED", "RETURNED"):
+            submitter = self.db.query(User).filter(User.id == doc.submitter_id).first()
+            if not submitter and app:
+                submitter = self.db.query(User).filter(User.id == app.submitter_id).first()
+
+            if submitter:
+                is_verified = (action == "VERIFIED")
+                title = f"Document {'Verified' if is_verified else 'Returned / Deficient'}: {doc.document_number}"
+                msg = f"Your document {doc.document_number} has been {'verified and approved' if is_verified else 'marked deficient / returned for rectification'}."
+                idemp = f"doc-{doc.id}-v{doc.version}-{action}-{submitter.id}"
+                self.dispatch_notification(
+                    user=submitter,
+                    title=title,
+                    message=msg,
+                    category="DOCUMENT_STATUS",
+                    severity="INFO" if is_verified else "WARNING",
+                    deep_link=deep_link,
+                    idempotency_key=idemp,
+                    application_id=app.id if app else None,
+                )
+

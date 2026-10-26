@@ -33,11 +33,16 @@ ALLOWED_MIME_TYPES = {
 
 
 def sanitize_filename(filename: str) -> str:
-    """Sanitizes file name to prevent directory traversal and illegal characters."""
-    base = os.path.basename(filename).strip()
+    """Sanitizes file name to prevent directory traversal and illegal characters, normalizing backslashes."""
+    normalized = filename.replace("\\", "/")
+    base = os.path.basename(normalized).strip()
     # Replace dangerous characters with underscore
     safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", base)
-    if not safe or safe.startswith("."):
+    while safe.startswith("."):
+        safe = safe[1:]
+    if not safe or safe == "_":
+        safe = "document.pdf"
+    elif not any(c.isalnum() for c in safe.split(".")[0]):
         safe = f"doc_{safe}"
     return safe
 
@@ -210,19 +215,52 @@ class MinIOStorageService(BaseStorageService):
             return False
 
 
-def get_storage_service() -> BaseStorageService:
+def get_storage_service(workspace: Optional[str] = None) -> BaseStorageService:
     """
     Factory function returning the configured storage backend.
-    Defaults to LocalStorageService; switches to MinIOStorageService when STORAGE_BACKEND='minio'.
+    Partitions local disk by workspace ('live' or 'sandbox').
     """
+    from app.workspace import current_workspace_var
+    ws = (workspace or current_workspace_var.get() or "live").strip().lower()
+    if ws not in ("live", "sandbox"):
+        ws = "live"
+
     backend = settings.STORAGE_BACKEND.lower()
     if backend in ("minio", "s3"):
         try:
-            return MinIOStorageService()
+            return MinIOStorageService(bucket=f"{settings.MINIO_BUCKET}-{ws}")
         except Exception as e:
             print(f"Warning: MinIO storage backend connection failed ({e}), falling back to LocalStorageService")
-            return LocalStorageService()
-    return LocalStorageService()
+            target_dir = os.path.join(settings.STORAGE_LOCAL_DIR, ws)
+            return LocalStorageService(target_dir)
+
+    target_dir = os.path.join(settings.STORAGE_LOCAL_DIR, ws)
+    return LocalStorageService(target_dir)
 
 
-storage_service = get_storage_service()
+class WorkspaceStorageProxy(BaseStorageService):
+    """Dynamically routes storage calls to the current workspace's storage backend."""
+    def save(self, file_bytes: bytes, storage_key: str, content_type: str = "application/octet-stream", workspace: Optional[str] = None) -> str:
+        svc = get_storage_service(workspace)
+        return svc.save(file_bytes, storage_key, content_type)
+
+    def get(self, storage_key: str, workspace: Optional[str] = None) -> bytes:
+        svc = get_storage_service(workspace)
+        try:
+            return svc.get(storage_key)
+        except FileNotFoundError:
+            # Fallback to base directory for backwards compatibility with legacy uploads
+            legacy_svc = LocalStorageService(settings.STORAGE_LOCAL_DIR)
+            return legacy_svc.get(storage_key)
+
+    def delete(self, storage_key: str, workspace: Optional[str] = None) -> bool:
+        svc = get_storage_service(workspace)
+        return svc.delete(storage_key)
+
+    def exists(self, storage_key: str, workspace: Optional[str] = None) -> bool:
+        svc = get_storage_service(workspace)
+        return svc.exists(storage_key)
+
+
+storage_service = WorkspaceStorageProxy()
+

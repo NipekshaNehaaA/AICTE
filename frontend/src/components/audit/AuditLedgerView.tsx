@@ -15,8 +15,11 @@ import {
   RefreshCw,
   FolderOpen,
 } from 'lucide-react';
+import { useApp } from '@/lib/app-context';
 
 export const AuditLedgerView: React.FC = () => {
+  const { evaluatorMode, isDemoMode } = useApp();
+  const isEvalActive = evaluatorMode || isDemoMode;
   const [entries, setEntries] = useState<any[]>([]);
   const [verificationResult, setVerificationResult] = useState<any | null>(null);
   const [loading, setLoading] = useState(false);
@@ -98,20 +101,24 @@ export const AuditLedgerView: React.FC = () => {
           >
             <ShieldCheck className="w-4 h-4" /> Verify Chain Integrity
           </button>
-          <button
-            onClick={simulateTampering}
-            className="btn-secondary !text-xs text-roseState-700 border-roseState-700/30 hover:bg-roseState-100"
-            title="Demo Feature: Deliberately corrupts a past hash to show instant detection"
-          >
-            <AlertTriangle className="w-4 h-4" /> Simulate Tampering
-          </button>
-          {verificationResult?.status === 'TAMPERING_DETECTED' && (
-            <button
-              onClick={restoreChain}
-              className="btn-secondary !text-xs text-mint-700 border-mint-700/30"
-            >
-              <RotateCcw className="w-4 h-4" /> Restore Chain
-            </button>
+          {isEvalActive && (
+            <>
+              <button
+                onClick={simulateTampering}
+                className="btn-secondary !text-xs text-roseState-700 border-roseState-700/30 hover:bg-roseState-100"
+                title="Demo Feature: Deliberately corrupts a past hash to show instant detection"
+              >
+                <AlertTriangle className="w-4 h-4" /> Simulate Tampering
+              </button>
+              {verificationResult?.status === 'TAMPERING_DETECTED' && (
+                <button
+                  onClick={restoreChain}
+                  className="btn-secondary !text-xs text-mint-700 border-mint-700/30"
+                >
+                  <RotateCcw className="w-4 h-4" /> Restore Chain
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>

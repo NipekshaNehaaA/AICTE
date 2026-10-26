@@ -132,7 +132,6 @@ def resend_failed_alert(
     notif.receipt_id = new_receipt
     notif.retry_count = (notif.retry_count or 0) + 1
     notif.fired_at = now
-    db.commit()
 
     dal.append_audit_entry(
         action_type="ALERT_RESENT",
@@ -145,6 +144,7 @@ def resend_failed_alert(
             "retry_count": notif.retry_count,
         },
     )
+    db.commit()
 
     return {
         "status": "RESENT",
@@ -159,6 +159,9 @@ class UserPreferencesPayload(BaseModel):
     preferred_channels: Optional[str] = "IN_APP,EMAIL"
     whatsapp_phone: Optional[str] = None
     opt_in_whatsapp: Optional[bool] = False
+    quiet_hours_start: Optional[int] = 22
+    quiet_hours_end: Optional[int] = 6
+    quiet_hours_enabled: Optional[bool] = True
 
 @router.get("/alerts/preferences")
 def get_user_preferences(
@@ -176,6 +179,9 @@ def get_user_preferences(
         "preferred_channels": (user.preferred_channels if user else "IN_APP,EMAIL") or "IN_APP,EMAIL",
         "whatsapp_phone": (user.whatsapp_phone if user else None) or "+91-9876543210",
         "opt_in_whatsapp": user.opt_in_whatsapp if user else False,
+        "quiet_hours_start": getattr(user, "quiet_hours_start", 22) if user else 22,
+        "quiet_hours_end": getattr(user, "quiet_hours_end", 6) if user else 6,
+        "quiet_hours_enabled": getattr(user, "quiet_hours_enabled", True) if user else True,
         "institution_language": inst.preferred_language if inst else None,
     }
 
@@ -197,6 +203,12 @@ def update_user_preferences(
             user.whatsapp_phone = payload.whatsapp_phone.strip()
         if payload.opt_in_whatsapp is not None:
             user.opt_in_whatsapp = payload.opt_in_whatsapp
+        if payload.quiet_hours_start is not None:
+            user.quiet_hours_start = payload.quiet_hours_start
+        if payload.quiet_hours_end is not None:
+            user.quiet_hours_end = payload.quiet_hours_end
+        if payload.quiet_hours_enabled is not None:
+            user.quiet_hours_enabled = payload.quiet_hours_enabled
 
     if ctx.institution_id and payload.preferred_language:
         inst = db.query(Institution).filter(Institution.id == ctx.institution_id).first()
@@ -214,6 +226,9 @@ def update_user_preferences(
             "preferred_language": payload.preferred_language,
             "preferred_channels": payload.preferred_channels,
             "opt_in_whatsapp": payload.opt_in_whatsapp,
+            "quiet_hours_start": payload.quiet_hours_start,
+            "quiet_hours_end": payload.quiet_hours_end,
+            "quiet_hours_enabled": payload.quiet_hours_enabled,
         },
     )
 
@@ -222,6 +237,165 @@ def update_user_preferences(
         "preferred_language": payload.preferred_language,
         "preferred_channels": payload.preferred_channels,
         "opt_in_whatsapp": payload.opt_in_whatsapp,
+        "quiet_hours_start": payload.quiet_hours_start,
+        "quiet_hours_end": payload.quiet_hours_end,
+        "quiet_hours_enabled": payload.quiet_hours_enabled,
+    }
+
+class TestMessagePayload(BaseModel):
+    channels: Optional[List[str]] = None
+    language: Optional[str] = None
+    recipient_email: Optional[str] = None
+    recipient_whatsapp: Optional[str] = None
+    template_key: Optional[str] = "DEFICIENCY_CURE_NOTICE"
+
+@router.post("/alerts/test-dispatch")
+@router.post("/alerts/test-message")
+def test_dispatch_message(
+    payload: TestMessagePayload,
+    ctx: RequestContext = Depends(get_request_context),
+    db: Session = Depends(get_db),
+):
+    """
+    Dispatches real statutory test messages across selected channels (IN_APP, EMAIL, WHATSAPP).
+    Returns real provider receipts (never faked). Logs dispatch to immutable audit ledger.
+    """
+    import uuid
+    from app.email_service import email_service
+    from app.twilio_whatsapp import whatsapp_adapter
+    from app.multilingual_notifications import NOTIFICATION_TEMPLATES
+
+    user = db.query(User).filter(User.id == ctx.user_id).first()
+    now = datetime.utcnow()
+    ws = getattr(ctx, "workspace", "sandbox")
+
+    lang = (payload.language or (user.preferred_language if user else "en") or "en").lower().strip()
+    if lang not in ("en", "hi", "ta"):
+        lang = "en"
+
+    # Resolve statutory template
+    template_key = payload.template_key or "DEFICIENCY_CURE_NOTICE"
+    tmpl_group = NOTIFICATION_TEMPLATES.get(template_key, NOTIFICATION_TEMPLATES["DEFICIENCY_CURE_NOTICE"])
+    tmpl = tmpl_group.get(lang, tmpl_group["en"])
+
+    title = tmpl["title"].format(
+        application_no="TEST-APP-2026",
+        institution_name="AICTE Demonstration Campus",
+    )
+    aph_ref = tmpl.get("aph_clause_ref", "Chapter I Clause 1.8(f)")
+    message = tmpl["message"].format(
+        application_no="TEST-APP-2026",
+        institution_name="AICTE Demonstration Campus",
+        due_date=(now + timedelta(days=14)).strftime("%d-%b-%Y"),
+        aph_clause_ref=aph_ref,
+        mode="Physical Site Inspection",
+    )
+
+    # Resolve channels
+    raw_channels = payload.channels
+    if not raw_channels:
+        pref = (user.preferred_channels if user else "IN_APP,EMAIL") or "IN_APP,EMAIL"
+        raw_channels = [c.strip() for c in pref.split(",") if c.strip()]
+
+    channel_results = []
+
+    for ch in raw_channels:
+        norm_ch = ch.upper().strip()
+        if norm_ch == "IN_APP":
+            test_notif = Notification(
+                user_id=ctx.user_id,
+                title=f"[TEST] {title}",
+                message=message,
+                category="SYSTEM_TEST",
+                severity="INFO",
+                is_read=False,
+                delivery_channel="IN_APP",
+                delivery_status="DELIVERED",
+                recipient_contact=user.email if user else "in_app_desk",
+                receipt_id=f"rec_inapp_{uuid.uuid4().hex[:12]}",
+                language=lang,
+                scheduled_for=now,
+                fired_at=now,
+            )
+            db.add(test_notif)
+            db.commit()
+            channel_results.append({
+                "channel": "IN_APP",
+                "status": "DELIVERED",
+                "receipt_id": test_notif.receipt_id,
+                "title": test_notif.title,
+                "note": "Delivered to in-app notification desk with zero latency.",
+                "timestamp": now.isoformat(),
+            })
+
+        elif norm_ch == "EMAIL":
+            target_email = payload.recipient_email or (user.email if user else "officer@aicte-india.org")
+            receipt = email_service.send_email(
+                to_email=target_email,
+                subject=f"[AICTE Regulatory Test] {title}",
+                text_content=message,
+                override_quiet=True, # Explicit test message overrides quiet hours
+                workspace=ws,
+                quiet_hours_start=getattr(user, "quiet_hours_start", 22) if user else 22,
+                quiet_hours_end=getattr(user, "quiet_hours_end", 6) if user else 6,
+                quiet_hours_enabled=getattr(user, "quiet_hours_enabled", True) if user else True,
+            )
+            channel_results.append({
+                "channel": "EMAIL",
+                "status": receipt.get("status", "DELIVERED"),
+                "receipt_id": receipt.get("message_id"),
+                "recipient": receipt.get("recipient", target_email),
+                "sandbox_note": receipt.get("sandbox_note"),
+                "failure_reason": receipt.get("failure_reason"),
+                "smtp_host": receipt.get("smtp_host"),
+                "smtp_port": receipt.get("smtp_port"),
+                "timestamp": now.isoformat(),
+            })
+
+        elif norm_ch in ("WHATSAPP", "WHATSAPP_SANDBOX"):
+            target_phone = payload.recipient_whatsapp or (user.whatsapp_phone if user else "+919876543210")
+            receipt = whatsapp_adapter.send_whatsapp_message(
+                to_phone=target_phone,
+                message_body=message,
+                user_opted_in=True,
+                workspace=ws,
+            )
+            channel_results.append({
+                "channel": "WHATSAPP_SANDBOX",
+                "status": receipt.get("status", "DELIVERED"),
+                "receipt_id": receipt.get("receipt_id"),
+                "recipient": receipt.get("recipient", target_phone),
+                "sandbox_note": receipt.get("sandbox_note"),
+                "twilio_status": receipt.get("twilio_status"),
+                "note": receipt.get("note") or receipt.get("reason"),
+                "error_message": receipt.get("error_message"),
+                "timestamp": now.isoformat(),
+            })
+
+    dal = ScopedDAL(db, ctx)
+    dal.append_audit_entry(
+        action_type="TEST_NOTIFICATION_DISPATCHED",
+        entity_type="NOTIFICATION",
+        entity_id=ctx.user_id or "SYSTEM",
+        metadata={
+            "language": lang,
+            "template_key": template_key,
+            "channels_tested": raw_channels,
+            "results_summary": [
+                {"channel": r["channel"], "status": r["status"], "receipt_id": r.get("receipt_id")}
+                for r in channel_results
+            ],
+        },
+    )
+    db.commit()
+
+    return {
+        "status": "COMPLETED",
+        "language": lang,
+        "template_key": template_key,
+        "workspace": ws,
+        "results": channel_results,
+        "dispatched_at": now.isoformat(),
     }
 
 @router.post("/scheduler/run-now")
@@ -231,9 +405,16 @@ def run_scheduler_manually(
 ):
     """Triggers an on-demand real-engine regulatory SLA & document expiry evaluation cycle."""
     from app.scheduler import regulatory_scheduler
-    stats = regulatory_scheduler.evaluate_and_dispatch_all(db)
+    target_clock = datetime.utcnow()
+    if getattr(ctx, "workspace", "live") == "sandbox":
+        from app.routers.demo_scenario import _demo_clock
+        if _demo_clock:
+            target_clock = _demo_clock
+    stats = regulatory_scheduler.evaluate_and_dispatch_all(db, target_time=target_clock)
     return {
         "status": "COMPLETED",
+        "workspace": getattr(ctx, "workspace", "live"),
+        "target_time": target_clock.isoformat(),
         "stats": stats,
     }
 

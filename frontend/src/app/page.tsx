@@ -17,7 +17,7 @@ import { CasePageView } from '@/components/case/CasePageView';
 import { PublicTrackingView } from '@/components/tracking/PublicTrackingView';
 
 export default function HomePage() {
-  const { activeNavTab } = useApp();
+  const { activeNavTab, currentUser } = useApp();
 
   // Dynamic Navigation Views
   if (activeNavTab === 'case') return <CasePageView />;
@@ -31,6 +31,15 @@ export default function HomePage() {
   if (activeNavTab === 'what-if') return <WhatIfSimulatorView />;
   if (activeNavTab === 'audit') return <AuditLedgerView />;
   if (activeNavTab === 'security-anomalies') return <SecurityAnomaliesView />;
+
+  // Institution User landing: Land on their own institution dashboard, not national command center
+  if (currentUser.role === 'INSTITUTION_USER') {
+    return (
+      <div className="space-y-6 animate-fade-in pb-12">
+        <StakeholderTrackingView defaultTab="INSTITUTION_TRACKER" />
+      </div>
+    );
+  }
 
   // Default: Grand Opening Executive Dashboard + Stakeholder Tracking Workspaces
   return (
